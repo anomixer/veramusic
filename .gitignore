@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Generated preview audio files (50MB+ uncompressed files)
+*.wav
+
+# Intermediate emulator files & simulation logs
+*.new
+*.tmp
+*.dis
+_sim_stream*.json
+
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
