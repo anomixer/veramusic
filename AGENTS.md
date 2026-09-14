@@ -97,7 +97,30 @@ The VERA card on Apple II provides:
   - Added peak normalization to preview WAV generation (`space_debris_hybrid.wav`), completely eliminating clipping while preserving full dynamic range.
   - Re-rendered `space_debris.hyb` (4,867 blocks, down from 4,885 blocks) and rebuilt `jukebox32.hdv`.
 
-### Milestone 8: Pure Timbre Piano Synthesis for Chopin's Fantaisie-Impromptu
+### Milestone 10: Native Windows VERA PSG Player (`psgplay.exe`) & ZSM Transcoder (`zsm2psg.mjs`)
+- **Motivation**:
+  - Needed a fast, zero-latency desktop player to evaluate `.psg` streams on Windows without booting AppleWin or Apple2TS.
+  - Needed a tool to convert Commander X16 ZSM music files (hybrid VERA PSG + YM2151 FM) into standalone 60 Hz VERA PSG register streams.
+- **ZSM to PSG Transcoder (`tools/zsm2psg.mjs`)**:
+  - Decodes ZSM header: extracts 24-bit loop offset and maps to exact frame index (`loopFrame`).
+  - Translates native PSG writes (channels 0 & 1).
+  - Translates YM2151 FM channels 0..7 to VERA PSG voices 2..9 with envelope shaping (e.g. warm triangle wave with natural piano decay for Title intro chime).
+  - Emits standard `veramusic` format: per 60 Hz frame `[count u8][ (reg u8, val u8) * count ]`, terminated by `0xFF [loopFrame u16 LE]`.
+  - All 5 tracks converted & verified via `check_psg.mjs` (`TITLE`, `HIGHSCORE`, `GAMEOVER`, `KILLED`, `LEVELCOMPLETE`).
+- **Native Windows Player (`tools/psgplay.exe`, `tools/psgplay.c`)**:
+  - Built with MSVC x86 (`/O2 /MT`) linking WinMM `winmm.lib` for zero external DLL dependencies.
+  - Full 16-channel VERA PSG emulation:
+    - 17-bit accumulator, 48,000 Hz stereo 16-bit PCM output (exact 800 samples/frame).
+    - Pulse (duty width), Sawtooth, Triangle, 16-bit Galois LFSR Noise.
+    - 64-step logarithmic hardware volume LUT.
+    - Soft analog saturation (`tanh`) preventing harsh digital clipping.
+  - Interactive controls matching `psgplay.asm`: `SPACE`/`P` pause, `M` mute, `+`/`-` volume, `[`/`]` 5s seek, `R` restart, `L` loop, `ESC`/`Q` quit.
+  - Single-line non-scrolling UI with strict 77-column formatting, in-place carriage return (`\r`), and 16-voice activity meters (`0123456789ABCDEF`).
+
+---
+
+## 3. Acoustic Fidelity & Sound Design Insights
+
 - **User Auditory Feedback**:
   - Multi-waveform experiments (allocating high-frequency pulse waves $pw=4, 8$ for hammer transients and treble chorusing on notes $\ge 56$) sounded like a clashing secondary synthesizer voice / electronic lead intruding over the piano melody.
   - User requested: "Keep the main melody instrument consistent throughout the entire song... keep it pure!".
@@ -406,6 +429,10 @@ To make MIDI piano on VERA PSG sound substantially more authentic ("原汁原味
 | `render_pure_pcm.mjs` | Node.js | 100% Pure PCM 44.1kHz reference renderer for MOD audio comparison |
 | `extract_all_samples.mjs` | Node.js | Utility: Extract all raw MOD instruments to individual WAV files |
 | `hybridstream.asm` | 6502 ASM | Apple II 60Hz IRQ hybrid stream player (`$2000`, Slot 2 & 4) |
+| `psgplay.exe` | Win32 C (x86) | Native Windows real-time VERA PSG player (WinMM waveOut, 48kHz stereo) |
+| `psgplay.c` | C | Source code for native Windows VERA PSG stream player |
+| `build_psgplay.bat` | Windows CMD | MSVC build script for compiling `psgplay.exe` |
+| `zsm2psg.mjs` | Node.js | Commander X16 ZSM (VERA PSG + YM2151 FM) → 60Hz PSG stream converter |
 | `mid2psg.mjs` | Node.js | Standard MIDI File (.mid) → 60Hz PSG register stream converter |
 | `mod2psg.mjs` | Node.js | ProTracker MOD → 60Hz PSG register stream converter |
 | `wav2pcm.mjs` | Node.js | Audio → VERA 8-bit signed PCM converter (TPDF dither, presets, preview wav) |
