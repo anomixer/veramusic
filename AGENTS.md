@@ -370,7 +370,48 @@ The VERA card on Apple II provides:
   - Chopin runtime updated to **5:02**, saving 2 ProDOS blocks (136 blocks, 69,306 bytes).
 - **Universal HDV VERA RAM PSG Integration & UI Synchronization**:
   - Switched Track 2 on `jukebox.hdv` to `vramChopin` (`2. CHOPIN FANTAISIE (5:02, VERA RAM PSG)`), eliminating all disk reading during playback.
-  - Expanded `TITLE` buffers in `psgstream.asm` and `build_jukebox.mjs` to 40 columns, standardizing durations across all menus and players.
+### Milestone 23: Chopin Voicing Overhaul (Authentic PSG Lead & Thunderous Saw Bass)
+- **User Problem**: "chopin 能不能更 psg 一點, 感覺太水晶音樂... (且我很不爽那個低音bass piano沒出來, 那是靈魂啊)"
+- **Root Cause**:
+  - Previously, all piano notes used pure triangle wave (`VERA_WAVE_TRI`), which lacks harmonic bite and sounded like a delicate music box ("水晶音樂").
+  - Deep bass piano notes (Notes 24..35, below 65 Hz) had their fundamentals below small speaker/ear frequency response cutoffs, causing the low bass octaves to sound extinguished.
+- **Engine Redesign (`tools/mid2psg.mjs`)**:
+  - **Treble & Melody (Note >= 60)**: Pure radiant 25% duty pulse wave (`VERA_WAVE_PULSE_25`) with hammer attack click, projecting with crisp, singing chiptune brilliance.
+  - **Thunderous Bass Foundation (Note < 48)**: Rich Sawtooth body (`VERA_WAVE_SAW`) with prolonged acoustic hold time (up to 500 ms) and sustained volume (58..63), replicating the authoritative cast-iron plate and thick copper-wound bass strings of a concert grand.
+  - **Sub-Bass Octave Layering**: Sub-bass notes below C2 (Note < 36, such as C#1 / Note 25) are mapped up an octave for clear acoustic presence while retaining low-frequency energy.
+  - **Middle Arpeggio Cushion (Notes 48..59)**: 50% pulse warmth (`VERA_WAVE_PULSE_50`) creating a rich polyphonic bed.
+- **Results**:
+  - Chopin *Fantaisie-Impromptu* transformed from weak "crystal music" into a majestic, room-shaking chiptune masterpiece. Stream compacts to **134 blocks** (68,472 bytes), leaving 45 free blocks on standard 140KB floppy.
+
+### Milestone 24: Beat It Multi-Track Rock Chiptune Engine & Solo-Only Pitch Bends
+- **Architecture**: Implemented multi-track ensemble mode (`isEnsemble`) in `mid2psg.mjs` triggered whenever MIDI files have 3+ distinct channels or GM drums on Channel 9.
+- **Instrument Roles & Custom VERA Waveforms**:
+  - **Fretless Slap Bass (Ch 1)**: High-speed monophonic channel reuse with biting Sawtooth body and 6502-safe decay.
+  - **Overdriven Lead & Rhythm Guitars (Ch 3, 4, 5, 6)**: 12.5% pulse pick attack transient transitioning into crunchy Sawtooth distortion.
+  - **Vocal Lead (Ch 0)**: Radiant singing 12.5% / 25% pulse lead.
+  - **Percussion (Ch 9)**: Dynamic pitch-dive kick drum (Note 48 -> Note 24 dive), explosive white noise snare, crisp hi-hats.
+- **Solo-Only Pitch Bend Filter**:
+  - `BeatIt.mid` contained 3,700+ micro-vibrato blues bends on rhythm guitar (Ch 3) and bass (Ch 1) that bent the rhythm riff out of tune. Restricted pitch bend processing exclusively to solo lead channels (`ev.ch === 4`, Van Halen solo).
+
+### Milestone 25: Beat It Intro Riff Clash Fix & Vocal Portamento Blues Scoop Bend
+- **Intro Guitar Riff 6th Note Semitone Clash Fix**:
+  - User reported that the 6th note of the opening riff sounded wrong in the intro ("前面兩次的音符不對, 後面都對").
+  - Analysis showed that in Channel 5 (Rhythm Guitar), a stray Note 52 (E3) fired 8–16 ticks before Note 54 (F#3) during the first two repetitions (tick 24372 and 27432), creating a dissonant clash against Channel 3's Note 66 (F#4) and Bass Note 42 (F#2).
+  - Automatically muted this stray Note 52 in `mid2psg.mjs`, making all three guitars and bass lock into pure, clean F# octaves.
+- **Chorus Vocal Melody Lift & Hardware Portamento Bend**:
+  - User feedback: "No One Wants To Be Defeated ==> 他唱 Be Defeated時, 是超高音(Be)~ 高音(de)~ 超高音(fea)~高音(ted)~". Originally all 8 syllables were a flat monotone Note 71 (B4).
+  - Generated and compared 5 distinct melodic/bending options (`ver. 1` to `ver. 5`).
+  - User selected **ver. 5** as the authentic "音魂":
+    - **"Be"** and **"fea-"**: NoteOn starts at Note 73 (D♭5 / 554 Hz) and glides smoothly up half a step to Note 74 (D5 / 587 Hz) across 8 frames (~133 ms), creating the signature Michael Jackson blues scoop bend!
+    - **"de-"** and **"-ted"**: crisp return to Note 71 (B4).
+  - Stream size: 271 blocks (138,389 bytes), well within the 300-block budget (blocks 300..570 on `jukebox.hdv`).
+
+### Milestone 26: Automated `jukebox.hdv.zip` Generation in Build Pipeline
+- **User Request**: "build hdv時, 順便生 .hdv.zip"
+- **Implementation (`tools/build_jukebox.mjs`)**:
+  - Implemented zero-dependency, pure Node.js PKZip packer utilizing `node:zlib` (`deflateRawSync` + `crc32`).
+  - Automatically deflates the 32MB `jukebox.hdv` into `jukebox.hdv.zip` (~2.7 MB, 92% compression) in only ~150 ms upon build completion.
+  - Seamlessly integrated into `build.bat`, `build.bat quick`, and `tools/build_jukebox.mjs`.
 
 ---
 

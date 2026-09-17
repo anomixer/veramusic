@@ -152,11 +152,12 @@ if errorlevel 1 goto FAIL
 echo.
 echo ============================================================
 echo  BUILD SUCCEEDED
-echo    jukebox.po   -- 140KB Floppy: Option 1 Demo, Option 2 Chopin
-echo    jukebox.hdv  -- 32MB HDV: Option 1 Demo, Option 2 Chopin,
-echo                    Option 3 Beat It, Option 4 Space Debris,
-echo                    Option 5 The Wellerman
-echo    Controls     -- ESC=Exit, P=Pause, +,-=VOL, [,]=SEEK, Timer T: mm:ss.s
+echo    jukebox.po      -- 140KB Floppy: Option 1 Demo, Option 2 Chopin
+echo    jukebox.hdv     -- 32MB HDV (and jukebox.hdv.zip):
+echo                       Option 1 Demo, Option 2 Chopin,
+echo                       Option 3 Beat It, Option 4 Space Debris,
+echo                       Option 5 The Wellerman
+echo    Controls        -- ESC=Exit, P=Pause, +,-=VOL, [,]=SEEK, Timer T: mm:ss.s
 echo ============================================================
 goto END
 

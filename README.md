@@ -43,12 +43,12 @@ Tested on:
 
 ## Included Jukebox Lineup
 
-### 1. Bootable 32MB Hard Disk (`jukebox.hdv`)
+### 1. Bootable 32MB Hard Disk (`jukebox.hdv` / `jukebox.hdv.zip`)
 | Track | Title | Format | Duration | Technology |
 |---|---|---|---|---|
 | **1** | **Melody Demo** | RAM PSG | 0:30 | 6502 RAM-resident 60 Hz PSG event player |
-| **2** | **Chopin: Fantaisie-Impromptu** | VERA RAM PSG | 5:02 | 16-voice pure triangle acoustic grand piano |
-| **3** | **Michael Jackson: Beat It** | Stream PSG | 3:58 | 16-voice rock band + GM channel 9 drums |
+| **2** | **Chopin: Fantaisie-Impromptu** | VERA RAM PSG | 5:02 | 16-voice authentic PSG lead + thunderous saw bass |
+| **3** | **Michael Jackson: Beat It** | Stream PSG | 3:58 | 16-voice rock chiptune engine + GM drums + vocal blues scoop bend |
 | **4** | **Captain: Space Debris** | Stream PCM | 5:05 | 8010 Hz direct-to-FIFO ProDOS disk streaming |
 | **5** | **Alexander Nakarada: The Wellerman** | Stream PCM | 2:00 | 8010 Hz full acoustic folk ballad with TPDF dither |
 
@@ -66,6 +66,7 @@ Tested on:
 veramusic/
 ├── build.bat                  # Automated build & packaging script
 ├── jukebox.hdv                # Pre-built bootable 32MB ProDOS hard disk image
+├── jukebox.hdv.zip            # Compressed 32MB hard disk image (~2.7MB, auto-generated)
 ├── jukebox.po                 # Pre-built bootable 140KB ProDOS floppy disk image
 ├── AGENTS.md                  # Comprehensive engineering & development log
 ├── src/                       # 6502 assembly players & Applesoft BASIC menus
@@ -86,7 +87,7 @@ veramusic/
 │   ├── mid2psg.mjs            # Standard MIDI (.mid) → 60 Hz PSG stream converter
 │   ├── mod2psg.mjs            # ProTracker MOD (.mod) → 60 Hz PSG stream converter
 │   ├── wav2pcm.mjs            # Audio (.wav/.mp3) → 8010 Hz VERA PCM converter
-│   ├── build_jukebox.mjs      # ProDOS volume & directory filesystem packager
+│   ├── build_jukebox.mjs      # ProDOS volume packager & automatic ZIP generator
 │   └── check_psg.mjs          # 6502 cycle & register write validator
 ├── music/                     # Audio source assets & converted streams (.mid, .mod, .psg, .pcm)
 └── scripts/                   # Audio analysis & one-off diagnostic utilities
@@ -102,7 +103,7 @@ veramusic/
 
 ### Master Build Command
 ```cmd
-# Re-assemble players, update BASIC menus, and pack jukebox.po & jukebox.hdv
+# Re-assemble players, update BASIC menus, and pack jukebox.po, jukebox.hdv & jukebox.hdv.zip
 build.bat quick
 
 # Full rebuild: reconvert all MIDI/MOD/PCM sources and pack images

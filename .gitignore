@@ -14,3 +14,10 @@ _sim_stream*.json
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Legacy H.E.R.O. / Mine Rescue test tracks
+music/TITLE.psg
+music/GAMEOVER.psg
+music/HIGHSCORE.psg
+music/KILLED.psg
+music/LEVELCOMPLETE.psg

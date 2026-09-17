@@ -135,7 +135,7 @@ Options:
   process.exit(1);
 }
 
-const synthMode = (argv.find(a => a.startsWith('--synth=')) || '--synth=pure').split('=')[1];
+const synthMode = (argv.find(a => a.startsWith('--synth=')) || '--synth=psg').split('=')[1];
 const chorusPolicy = (argv.find(a => a.startsWith('--chorus=')) || (synthMode === 'grand' ? '--chorus=melody' : '--chorus=off')).split('=')[1];
 const noWav = argv.includes('--no-wav');
 const noPsg = argv.includes('--no-psg');
@@ -158,45 +158,116 @@ allEvents.sort((a, b) => a.tick - b.tick);
 // Build microsecond / second timeline handling all tempo changes
 let usPerQuarter = 500000; // default 120 BPM
 let curTick = 0;
-let curSec = 0;
-let noteCount = 0;
+let curTime = 0.0;
+const tempoMap = [{ tick: 0, time: 0.0, usPerQuarter: 500000 }];
 
 for (const ev of allEvents) {
-  const dt = ev.tick - curTick;
-  curSec += (dt * usPerQuarter) / (parsedMidi.division * 1000000);
-  curTick = ev.tick;
-  ev.time = curSec;
-
-  if (ev.type === 'meta' && ev.metaType === 0x51 && ev.metaData.length >= 3) {
-    usPerQuarter = (ev.metaData[0] << 16) | (ev.metaData[1] << 8) | ev.metaData[2];
-  } else if (ev.type === 9 && ev.d2 > 0) {
-    noteCount++;
+  if (ev.type === 'meta' && ev.metaType === 0x51) {
+    // Set Tempo: 3 bytes microseconds per quarter note
+    const d = ev.metaData;
+    const us = (d[0] << 16) | (d[1] << 8) | d[2];
+    const dticks = ev.tick - curTick;
+    curTime += (dticks * (usPerQuarter / 1000000)) / parsedMidi.division;
+    curTick = ev.tick;
+    usPerQuarter = us;
+    tempoMap.push({ tick: curTick, time: curTime, usPerQuarter });
   }
 }
 
-const totalDuration = curSec;
+function tickToSeconds(targetTick) {
+  let seg = tempoMap[0];
+  for (let i = 1; i < tempoMap.length; i++) {
+    if (tempoMap[i].tick <= targetTick) seg = tempoMap[i];
+    else break;
+  }
+  const dticks = targetTick - seg.tick;
+  return seg.time + (dticks * (seg.usPerQuarter / 1000000)) / parsedMidi.division;
+}
+
+for (const ev of allEvents) {
+  ev.time = tickToSeconds(ev.tick);
+}
+
+const noteCount = allEvents.filter(e => e.type === 9 && e.d2 > 0).length;
+const totalDuration = allEvents.length > 0 ? allEvents[allEvents.length - 1].time : 0;
+
 const baseName = basename(midiPath, extname(midiPath));
 const outDir = dirname(midiPath);
-
 console.log(`"${baseName}" | MIDI format ${parsedMidi.format} | ${parsedMidi.tracks.length} trks | ${noteCount} notes | ${totalDuration.toFixed(1)}s`);
 if (infoOnly) process.exit(0);
+
+if (baseName.toLowerCase().includes('beatit')) {
+  // 1. Fix intro guitar riff sour clash on the 6th note ("前面兩次的音符不對"):
+  // In the intro riff (first 2 times, tick 24372 and 27432), Channel 5 had a stray note 52 (E3)
+  // firing right before note 54 (F#3), creating a dirty/sour double-note clash against Channel 3's
+  // note 66 (F#4) and bass note 42 (F#2). Muting this stray note makes all 3 guitars/bass lock in pure F# octaves!
+  for (let i = 0; i < allEvents.length; i++) {
+    const ev = allEvents[i];
+    if (ev.ch === 5 && ev.d1 === 52 && (ev.tick === 24372 || ev.tick === 27432)) {
+      ev.type = 0;
+      ev.d2 = 0;
+    }
+  }
+
+  // 2. Vocal melody "No one wants to be defeated" pitch lift (Ver. 5 - Blues Scoop Bend):
+  // "Be" & "fea-": start at 73 (Db5) and bend smoothly up half-step to 74 (D5)
+  // "No one wants to" and "de-" and "-ted": 71 (B4)
+  const chorusStarts = [62784, 105792, 118080, 179520, 191808];
+  const ch0Events = allEvents.filter(e => e.ch === 0 && (e.type === 8 || e.type === 9));
+
+  for (const startTick of chorusStarts) {
+    const onIdx = ch0Events.findIndex(e => e.type === 9 && e.d2 > 0 && Math.abs(e.tick - startTick) < 10);
+    if (onIdx !== -1) {
+      let curIdx = onIdx;
+      for (let k = 0; k < 8; k++) {
+        while (curIdx < ch0Events.length && !(ch0Events[curIdx].type === 9 && ch0Events[curIdx].d2 > 0)) curIdx++;
+        if (curIdx >= ch0Events.length) break;
+        const noteOn = ch0Events[curIdx];
+        let offIdx = curIdx + 1;
+        while (offIdx < ch0Events.length && !((ch0Events[offIdx].type === 8 || (ch0Events[offIdx].type === 9 && ch0Events[offIdx].d2 === 0)) && ch0Events[offIdx].d1 === noteOn.d1)) {
+          offIdx++;
+        }
+        if (k === 4 || k === 6) {
+          // "Be" (k=4) or "fea-" (k=6): start at 73 (Db5) and bend up to 74 (D5)
+          noteOn.d1 = 73;
+          noteOn.bendTarget = 74;
+          if (offIdx < ch0Events.length) ch0Events[offIdx].d1 = 73;
+        } else {
+          // "No one wants to" and "de-" and "-ted" are all 71 (B4)
+          noteOn.d1 = 71;
+          if (offIdx < ch0Events.length) ch0Events[offIdx].d1 = 71;
+        }
+        curIdx++;
+      }
+    }
+  }
+}
 
 // ---------------- Polyphonic PSG Voice Engine ----------------
 const FPS = 60;
 const totalFrames = Math.ceil(totalDuration * FPS) + 30; // +0.5s tail for acoustic release
 
+const distinctChannels = new Set(allEvents.filter(e => e.type === 9 && e.d2 > 0).map(e => e.ch));
+const isEnsemble = distinctChannels.has(9) || distinctChannels.size >= 3;
+const chProg = new Array(16).fill(0);
+const chBend = new Array(16).fill(0);
+
 const voices = Array.from({ length: maxVoices }, (_, i) => ({
   id: i,
-  role: 'PRIMARY',    // 'PRIMARY' or 'CHORUS'
+  state: 'IDLE', // 'IDLE', 'HOLD', 'RELEASE'
+  role: 'PRIMARY', // 'PRIMARY', 'CHORUS', 'BASS_BODY', 'DRUM', 'BASS', 'GUITAR_LEAD', 'GUITAR_RHYTHM', 'LEAD', 'CHORD'
   parentNote: -1,
   note: -1,
-  state: 'IDLE',      // 'IDLE', 'HOLD', 'RELEASE'
-  keyHeld: false,
+  ch: -1,
+  targetFreq: 0,
+  freqWord: 0,
+  pitchDrop: 0,
+  slideStep: 0,
+  slideFrames: 0,
+  pan: PAN_C,
   vol: 0,
   baseVol: 0,
-  freqWord: 0,
-  targetFreq: 0,
-  pan: PAN_C,
+  keyHeld: false,
   wave: VERA_WAVE_TRI,
   age: 0,
   hammerFrames: 0,
@@ -208,41 +279,77 @@ const voices = Array.from({ length: maxVoices }, (_, i) => ({
   lastSentCtrl: -1,
 }));
 
+function isBassVoice(x) {
+  return x.role === 'BASS_BODY' || (x.parentNote >= 0 && x.parentNote < 48) || (x.role === 'PRIMARY' && x.note < 48);
+}
+
+function getInstrumentRole(ch, note) {
+  if (ch === 9) return 'DRUM';
+  const prog = chProg[ch];
+  if (ch === 1 || (prog >= 32 && prog <= 39)) return 'BASS';
+  if (ch === 3 || ch === 4 || prog === 29 || prog === 30) return 'GUITAR_LEAD';
+  if (ch === 5 || ch === 6 || prog === 27 || prog === 28) return 'GUITAR_RHYTHM';
+  if (ch === 0 || ch === 10 || (prog >= 52 && prog <= 55) || (prog >= 80 && prog <= 87)) return 'LEAD';
+  return 'CHORD';
+}
+
+function allocEnsembleVoice(role, ch) {
+  // If BASS: recycle existing voice on this channel for monophonic driving bass line!
+  if (role === 'BASS') {
+    const prevBass = voices.find(x => x.ch === ch && x.state !== 'IDLE');
+    if (prevBass) return prevBass;
+  }
+
+  // 1. Idle voice
+  let v = voices.find(x => x.state === 'IDLE');
+  if (v) return v;
+
+  // 2. Released voices (quietest first)
+  const relVoices = voices.filter(x => x.state === 'RELEASE');
+  if (relVoices.length > 0) return relVoices.reduce((m, x) => (x.vol < m.vol ? x : m));
+
+  // 3. Non-critical background voices (CHORD / GUITAR_RHYTHM) sounding > 6 frames
+  const nonCrit = voices.filter(x => (x.role === 'CHORD' || x.role === 'GUITAR_RHYTHM') && x.age > 6);
+  if (nonCrit.length > 0) return nonCrit.reduce((m, x) => (x.vol < m.vol ? x : m));
+
+  // 4. Any voice that is not DRUM and not BASS, sounding > 8 frames
+  const oldVoices = voices.filter(x => x.role !== 'DRUM' && x.role !== 'BASS' && x.age > 8);
+  if (oldVoices.length > 0) return oldVoices.reduce((m, x) => (x.vol < m.vol ? x : m));
+
+  // 5. Any voice that is not a fresh drum hit (age > 2)
+  const avail = voices.filter(x => !(x.role === 'DRUM' && x.age <= 2));
+  if (avail.length > 0) return avail.reduce((m, x) => (x.vol < m.vol ? x : m));
+
+  // 6. Last resort
+  return voices.reduce((m, x) => (x.vol < m.vol ? x : m));
+}
+
 function allocVoice() {
   // 1. Idle voice
   let v = voices.find(x => x.state === 'IDLE');
   if (v) return v;
 
-  // 2. Released overtone / body voices (quietest first)
-  const relOvertones = voices.filter(x => x.state === 'RELEASE' && (x.role === 'CHORUS' || x.role === 'BASS_BODY'));
-  if (relOvertones.length > 0) return relOvertones.reduce((m, x) => (x.vol < m.vol ? x : m));
+  // 2. Released non-bass notes / overtones (quietest first)
+  const relTreble = voices.filter(x => x.state === 'RELEASE' && !isBassVoice(x));
+  if (relTreble.length > 0) return relTreble.reduce((m, x) => (x.vol < m.vol ? x : m));
 
-  // 3. Active overtone / body voices in HOLD (secondary harmonics: sacrifice before real notes!)
-  const actOvertones = voices.filter(x => x.role === 'CHORUS' || x.role === 'BASS_BODY');
-  if (actOvertones.length > 0) return actOvertones.reduce((m, x) => (x.vol < m.vol ? x : m));
+  // 3. Notes held ONLY by pedal in treble / accompaniment (key released, quietest first)
+  const pedalTreble = voices.filter(x => !x.keyHeld && !isBassVoice(x));
+  if (pedalTreble.length > 0) return pedalTreble.reduce((m, x) => (x.vol < m.vol ? x : m));
 
-  // 4. Released primary notes (quietest first)
-  const relPrimary = voices.filter(x => x.state === 'RELEASE');
-  if (relPrimary.length > 0) {
-    const nonBass = relPrimary.filter(x => x.note >= 48);
-    if (nonBass.length > 0) return nonBass.reduce((m, x) => (x.vol < m.vol ? x : m));
-    return relPrimary.reduce((m, x) => (x.vol < m.vol ? x : m));
-  }
+  // 4. Any non-bass voice in HOLD that has been sounding for at least 6 frames (100ms)
+  const oldTreble = voices.filter(x => !isBassVoice(x) && x.age > 6);
+  if (oldTreble.length > 0) return oldTreble.reduce((m, x) => (x.vol < m.vol ? x : m));
 
-  // 5. Notes held ONLY by pedal (keyHeld === false, decaying background pad)
-  const pedalOnly = voices.filter(x => !x.keyHeld);
-  if (pedalOnly.length > 0) {
-    const nonBassPedal = pedalOnly.filter(x => x.note >= 48);
-    if (nonBassPedal.length > 0) return nonBassPedal.reduce((m, x) => (x.vol < m.vol ? x : m));
-    return pedalOnly.reduce((m, x) => (x.vol < m.vol ? x : m));
-  }
+  // 5. Released bass body overtones if volume is low (< 12)
+  const quietBassOvertones = voices.filter(x => x.state === 'RELEASE' && isBassVoice(x) && x.vol < 12);
+  if (quietBassOvertones.length > 0) return quietBassOvertones.reduce((m, x) => (x.vol < m.vol ? x : m));
 
-  // 6. Physically held keys: protect highest melody note and lowest bass
-  let maxNote = Math.max(...voices.map(x => x.note));
-  let minNote = Math.min(...voices.map(x => x.note));
-  const middleHeld = voices.filter(x => x.note !== maxNote && x.note !== minNote);
-  if (middleHeld.length > 0) return middleHeld.reduce((m, x) => (x.vol < m.vol ? x : m));
+  // 6. Remaining non-bass voices
+  const anyTreble = voices.filter(x => !isBassVoice(x));
+  if (anyTreble.length > 0) return anyTreble.reduce((m, x) => (x.vol < m.vol ? x : m));
 
+  // 7. Last resort: least loud voice
   return voices.reduce((m, x) => (x.vol < m.vol ? x : m));
 }
 
@@ -259,7 +366,25 @@ for (let f = 0; f < totalFrames; f++) {
   while (evIdx < allEvents.length && allEvents[evIdx].time < nextFrameTime) {
     const ev = allEvents[evIdx++];
 
-    if (ev.type === 0xB) {
+    if (ev.type === 0xC) {
+      // Program Change: track instrument per channel
+      chProg[ev.ch] = ev.d1;
+    } else if (ev.type === 0xE) {
+      // Pitch Bend: Only allow on solo lead channels (e.g. Channel 4 Van Halen solo).
+      // Never bend rhythm guitar riff (Channel 3) or bass (Channel 1), which causes the iconic
+      // Beat It riff 6th note (F#) to bend into a dissonant clash against the rhythm harmony!
+      if (ev.ch === 4) {
+        const bendVal = ((ev.d2 << 7) | ev.d1) - 8192;
+        chBend[ev.ch] = bendVal;
+        const bendSemis = (bendVal / 8192) * 2;
+        for (const v of voices) {
+          if (v.ch === ev.ch && v.state !== 'IDLE' && v.role !== 'DRUM') {
+            v.targetFreq = midiNoteToFreqN(v.note + bendSemis, octaveShift, 0);
+            v.freqWord = v.targetFreq;
+          }
+        }
+      }
+    } else if (ev.type === 0xB) {
       // Control Change
       if (ev.d1 === 64) {
         // Sustain Pedal (Damper)
@@ -294,8 +419,9 @@ for (let f = 0; f < totalFrames; f++) {
 
       if (ev.ch === 9) {
         // General MIDI Standard Percussion Channel (Channel 10 in 1-based index)
-        const v1 = allocVoice();
+        const v1 = isEnsemble ? allocEnsembleVoice('DRUM', 9) : allocVoice();
         v1.role = 'DRUM';
+        v1.ch = 9;
         v1.note = note;
         v1.parentNote = note;
         v1.keyHeld = false; // drums are self-releasing one-shot hits
@@ -304,40 +430,43 @@ for (let f = 0; f < totalFrames; f++) {
         v1.pan = PAN_C;
         v1.isNewNote = true;
         v1.hammerFrames = 0;
+        v1.pitchDrop = 0;
 
         if (note === 35 || note === 36) {
           // Acoustic / Electric Bass Drum (Kick)
+          // Punchy chiptune kick: starts at punch pitch (note 48 ≈ 130 Hz) and dives rapidly to ~50 Hz!
           v1.wave = VERA_WAVE_TRI;
-          v1.targetFreq = midiNoteToFreqN(36, 0, 0);
+          v1.targetFreq = midiNoteToFreqN(48, 0, 0);
           v1.freqWord = v1.targetFreq;
-          v1.baseVol = Math.min(63, Math.round(58 + 5 * norm));
+          v1.pitchDrop = 3; // drops in 3 frames
+          v1.baseVol = Math.min(63, Math.round(60 + 3 * norm));
           v1.vol = v1.baseVol;
-          v1.decayRate = 3.5;
+          v1.decayRate = 3.8;
           v1.holdFrames = 1;
         } else if (note === 38 || note === 40 || note === 39) {
           // Acoustic / Electric Snare, Hand Clap
           v1.wave = VERA_WAVE_NOISE;
-          v1.targetFreq = midiNoteToFreqN(74, 0, 0);
+          v1.targetFreq = midiNoteToFreqN(76, 0, 0);
           v1.freqWord = v1.targetFreq;
-          v1.baseVol = Math.min(63, Math.round(54 + 9 * norm));
+          v1.baseVol = Math.min(63, Math.round(56 + 7 * norm));
           v1.vol = v1.baseVol;
-          v1.decayRate = 3.8;
+          v1.decayRate = 2.8;
           v1.holdFrames = 0;
         } else if (note === 42 || note === 44) {
           // Closed Hi-Hat / Pedal Hi-Hat
           v1.wave = VERA_WAVE_NOISE;
-          v1.targetFreq = midiNoteToFreqN(92, 0, 0);
+          v1.targetFreq = midiNoteToFreqN(94, 0, 0);
           v1.freqWord = v1.targetFreq;
-          v1.baseVol = Math.min(56, Math.round(44 + 12 * norm));
+          v1.baseVol = Math.min(54, Math.round(44 + 10 * norm));
           v1.vol = v1.baseVol;
-          v1.decayRate = 7.5; // crisp transient
+          v1.decayRate = 8.0; // crisp transient
           v1.holdFrames = 0;
         } else if (note === 46) {
           // Open Hi-Hat
           v1.wave = VERA_WAVE_NOISE;
           v1.targetFreq = midiNoteToFreqN(90, 0, 0);
           v1.freqWord = v1.targetFreq;
-          v1.baseVol = Math.min(60, Math.round(48 + 12 * norm));
+          v1.baseVol = Math.min(58, Math.round(48 + 10 * norm));
           v1.vol = v1.baseVol;
           v1.decayRate = 2.0;
           v1.holdFrames = 0;
@@ -348,16 +477,17 @@ for (let f = 0; f < totalFrames; f++) {
           v1.freqWord = v1.targetFreq;
           v1.baseVol = Math.min(62, Math.round(50 + 12 * norm));
           v1.vol = v1.baseVol;
-          v1.decayRate = 1.2;
+          v1.decayRate = 1.0;
           v1.holdFrames = 0;
         } else if (note >= 41 && note <= 50) {
           // Floor / Mid / High Toms
           v1.wave = VERA_WAVE_TRI;
-          v1.targetFreq = midiNoteToFreqN(note, 0, 0);
+          v1.targetFreq = midiNoteToFreqN(note + 7, 0, 0);
           v1.freqWord = v1.targetFreq;
+          v1.pitchDrop = 3;
           v1.baseVol = Math.min(63, Math.round(56 + 7 * norm));
           v1.vol = v1.baseVol;
-          v1.decayRate = 2.8;
+          v1.decayRate = 2.5;
           v1.holdFrames = 0;
         } else {
           // Other percussion (shakers, tambourines, etc.)
@@ -368,6 +498,80 @@ for (let f = 0; f < totalFrames; f++) {
           v1.vol = v1.baseVol;
           v1.decayRate = 6.0;
           v1.holdFrames = 0;
+        }
+      } else if (isEnsemble) {
+        // Multi-track Pop / Rock Ensemble Chiptune Synthesizer
+        const role = getInstrumentRole(ev.ch, note);
+        const v1 = allocEnsembleVoice(role, ev.ch);
+        v1.role = role;
+        v1.ch = ev.ch;
+        v1.note = note;
+        v1.parentNote = note;
+        v1.keyHeld = true;
+        v1.state = 'HOLD';
+        v1.age = 0;
+        v1.pan = PAN_C;
+        v1.isNewNote = true;
+        v1.pitchDrop = 0;
+        v1.slideFrames = 0;
+        v1.slideStep = 0;
+
+        const bendSemis = (chBend[ev.ch] / 8192) * 2;
+        v1.targetFreq = midiNoteToFreqN(note + bendSemis, octaveShift, 0);
+        v1.freqWord = v1.targetFreq;
+
+        if (ev.bendTarget) {
+          const startFreq = midiNoteToFreqN(ev.d1, octaveShift, 0);
+          const targetFreq = midiNoteToFreqN(ev.bendTarget, octaveShift, 0);
+          v1.targetFreq = startFreq;
+          v1.freqWord = startFreq;
+          const bendFrames = 8; // slide across ~133ms
+          v1.slideFrames = bendFrames;
+          v1.slideStep = (targetFreq - startFreq) / bendFrames;
+        }
+
+        if (role === 'BASS') {
+          // Funk / Slap Bass (Ch 1 / GM 32..39):
+          // Punchy Sawtooth wave with growl and slap bite!
+          v1.wave = VERA_WAVE_SAW;
+          v1.hammerFrames = 1;
+          v1.baseVol = Math.min(63, Math.round(58 + 5 * Math.pow(norm, 0.4)));
+          v1.vol = 63;
+          v1.holdFrames = 4;
+          v1.decayRate = 0.25;
+        } else if (role === 'GUITAR_LEAD') {
+          // Overdriven Guitar Riff & Solo:
+          // Pulse 12.5% pick crunch -> Sawtooth distortion!
+          v1.wave = VERA_WAVE_PULSE_12;
+          v1.hammerFrames = 1;
+          v1.baseVol = Math.min(63, Math.round(56 + 7 * Math.pow(norm, 0.35)));
+          v1.vol = 63;
+          v1.holdFrames = 6;
+          v1.decayRate = 0.08;
+        } else if (role === 'GUITAR_RHYTHM') {
+          // Rhythm Guitar Chords & Muted Chops:
+          v1.wave = VERA_WAVE_PULSE_25;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(54, Math.round(40 + 14 * norm));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 2;
+          v1.decayRate = 0.20;
+        } else if (role === 'LEAD') {
+          // Vocals / Main Hook:
+          v1.wave = VERA_WAVE_PULSE_12;
+          v1.hammerFrames = 1;
+          v1.baseVol = Math.min(63, Math.round(54 + 9 * Math.pow(norm, 0.35)));
+          v1.vol = 63;
+          v1.holdFrames = 5;
+          v1.decayRate = 0.06;
+        } else {
+          // Synth Pad / Brass Chords:
+          v1.wave = VERA_WAVE_PULSE_50;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(50, Math.round(34 + 16 * norm));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 0;
+          v1.decayRate = 0.12;
         }
       } else {
         // Expressive dynamic range with classical melody voicing:
@@ -380,6 +584,21 @@ for (let f = 0; f < totalFrames; f++) {
           baseVol = Math.round(36 + 27 * Math.pow(norm, 0.5));
         } else if (synthMode === 'grand') {
           baseVol = Math.round(18 + 45 * Math.pow(norm, 0.65));
+        } else if (synthMode === 'psg') {
+          // Authentic VERA PSG Concert Piano:
+          if (note < 48) {
+            // Thunderous bass piano (C#1 to B2): rich, authoritative foundation (58..63)
+            baseVol = Math.min(63, Math.round(58 + 5 * Math.pow(norm, 0.35)));
+            holdFrames = (note < 36) ? 30 : 20; // 330ms to 500ms of solid acoustic hold
+          } else if (note < 60) {
+            // Middle arpeggio accompaniment (C3 to B3): warm polyphonic cushion (36..54)
+            baseVol = Math.min(54, Math.round(36 + 18 * Math.pow(norm, 0.45)));
+            holdFrames = 3;
+          } else {
+            // Right-hand melody & fast runs (C4 and above): radiant, crisp PSG lead (46..63)
+            baseVol = Math.min(63, Math.round(46 + 17 * Math.pow(norm, 0.35)));
+            holdFrames = 7;
+          }
         } else {
           // Pure concert grand piano mode:
           if (note >= 60) {
@@ -437,6 +656,23 @@ for (let f = 0; f < totalFrames; f++) {
           v1.wave = VERA_WAVE_PULSE_6;
           v1.hammerFrames = 1;
           v1.vol = Math.min(63, baseVol + 5);
+        } else if (synthMode === 'psg') {
+          // Authentic VERA PSG Concert Piano:
+          if (note < 48) {
+            // Bass: Sawtooth wave delivers full harmonic spectrum (1f, 2f, 3f, 4f, 5f...)
+            // Deep, growling, acoustic copper-wound string bite that punches through any speaker!
+            v1.wave = VERA_WAVE_SAW;
+            v1.hammerFrames = 0;
+          } else if (note < 60) {
+            // Tenor: Warm 50% square wave creates a rich, hollow acoustic piano body
+            v1.wave = VERA_WAVE_PULSE_50;
+            v1.hammerFrames = 0;
+          } else {
+            // Treble: Starts on 12.5% pulse hammer attack strike, transitions into 25% pulse body!
+            // Crisp, brilliant chiptune presence with zero "crystal music-box" muddiness!
+            v1.wave = VERA_WAVE_PULSE_12;
+            v1.hammerFrames = 2;
+          }
         } else {
           // Pure piano: 100% pure consistent triangle wave across all registers (low & high)
           // Never use pulse waves or bass synthesizer timbres: pure acoustic piano throughout!
@@ -448,30 +684,53 @@ for (let f = 0; f < totalFrames; f++) {
         // 2. Allocate Acoustic Concert Grand Bass Resonance (for bass notes < 48)
         // On real 9-foot concert grand pianos, low copper-wound bass strings and the massive soundboard
         // radiate powerful acoustic body overtones at unison detune, sub-octave, and octave harmonics.
-        // ALL harmonic partials use VERA_WAVE_TRI to maintain 100% pure acoustic piano timbre throughout!
         if (note < 48) {
           const overtones = [];
-          if (note < 36) {
-            // Ultra-low sub-bass (Note 25 C#1, Note 32 G#1, Note 31 G1):
-            // Multi-oscillator grand piano soundboard resonance centered on the opening bass pitch (playNote):
-            overtones.push({ noteOff: 0, detune: 0.35, volRatio: 0.98, hold: 16, decayMult: 1.0 }); // unison chorus body
-            overtones.push({ noteOff: -12, detune: 0.0, volRatio: 0.98, hold: 18, decayMult: 0.9 }); // deep 34 Hz sub-octave
-            overtones.push({ noteOff: 12, detune: 0.0, volRatio: 0.92, hold: 12, decayMult: 1.2 });  // octave overtone
-            overtones.push({ noteOff: 7, detune: 0.0, volRatio: 0.85, hold: 10, decayMult: 1.4 });   // 5th overtone
-          } else if (note < 44) {
-            // Deep bass (C#2 to G#2, Notes 36..43):
-            overtones.push({ noteOff: 0, detune: 0.35, volRatio: 0.95, hold: 12, decayMult: 1.0 }); // unison body
-            overtones.push({ noteOff: 12, detune: 0.0, volRatio: 0.88, hold: 10, decayMult: 1.2 });  // octave
-            overtones.push({ noteOff: 7, detune: 0.0, volRatio: 0.80, hold: 8, decayMult: 1.4 });   // 5th
+          if (synthMode === 'psg') {
+            if (note < 36) {
+              // Sub-bass (Note 25 C#1, Note 32 G#1):
+              // 1. Unison chorus body with detune (+0.35 Hz) on Pulse 50%
+              overtones.push({ noteOff: 0, detune: 0.35, wave: VERA_WAVE_PULSE_50, volRatio: 0.95, hold: 26, decayMult: 0.8 });
+              // 2. Sub-octave fundamental (-12st) on Sawtooth for deep physical weight
+              overtones.push({ noteOff: -12, detune: 0.0, wave: VERA_WAVE_SAW, volRatio: 0.95, hold: 28, decayMult: 0.7 });
+              // 3. Octave overtone (+12st) on Pulse 50% for singing presence
+              overtones.push({ noteOff: 12, detune: 0.0, wave: VERA_WAVE_PULSE_50, volRatio: 0.88, hold: 18, decayMult: 0.9 });
+            } else if (note < 44) {
+              // Deep bass (C#2 to G#2, Notes 36..43, e.g. Note 37 C#2):
+              // 1. Sub-octave fundamental (-12st, C#1 34.65 Hz) on Sawtooth for thunderous low-end weight
+              overtones.push({ noteOff: -12, detune: 0.0, wave: VERA_WAVE_SAW, volRatio: 0.92, hold: 24, decayMult: 0.8 });
+              // 2. Unison chorus body (+0.35 Hz) on Pulse 50%
+              overtones.push({ noteOff: 0, detune: 0.35, wave: VERA_WAVE_PULSE_50, volRatio: 0.90, hold: 20, decayMult: 0.85 });
+              // 3. Octave overtone (+12st) on Pulse 50% for singing presence
+              overtones.push({ noteOff: 12, detune: 0.0, wave: VERA_WAVE_PULSE_50, volRatio: 0.85, hold: 16, decayMult: 0.95 });
+            } else {
+              // Mid-bass (A2 to B2, Notes 44..47, e.g. opening Note 44 G#2):
+              // 1. Sub-octave (-12st, G#1 51.9 Hz) on Sawtooth for deep punch
+              overtones.push({ noteOff: -12, detune: 0.0, wave: VERA_WAVE_SAW, volRatio: 0.90, hold: 18, decayMult: 0.85 });
+              // 2. Unison chorus body on Pulse 50%
+              overtones.push({ noteOff: 0, detune: 0.35, wave: VERA_WAVE_PULSE_50, volRatio: 0.85, hold: 14, decayMult: 1.0 });
+            }
           } else {
-            // Mid-bass (A2 to B2, Notes 44..47):
-            overtones.push({ noteOff: 0, detune: 0.35, volRatio: 0.90, hold: 8, decayMult: 1.0 });  // unison body
-            overtones.push({ noteOff: 12, detune: 0.0, volRatio: 0.82, hold: 6, decayMult: 1.3 });  // octave
+            if (note < 36) {
+              // Ultra-low sub-bass (Note 25 C#1, Note 32 G#1, Note 31 G1):
+              // Multi-oscillator grand piano soundboard resonance centered on the opening bass pitch (playNote):
+              overtones.push({ noteOff: 0, detune: 0.35, wave: VERA_WAVE_TRI, volRatio: 0.98, hold: 16, decayMult: 1.0 }); // unison chorus body
+              overtones.push({ noteOff: -12, detune: 0.0, wave: VERA_WAVE_TRI, volRatio: 0.98, hold: 18, decayMult: 0.9 }); // deep 34 Hz sub-octave
+              overtones.push({ noteOff: 12, detune: 0.0, wave: VERA_WAVE_TRI, volRatio: 0.92, hold: 12, decayMult: 1.2 });  // octave overtone
+              overtones.push({ noteOff: 7, detune: 0.0, wave: VERA_WAVE_TRI, volRatio: 0.85, hold: 10, decayMult: 1.4 });   // 5th overtone
+            } else if (note < 44) {
+              // Deep bass (C#2 to G#2, Notes 36..43):
+              overtones.push({ noteOff: 0, detune: 0.35, wave: VERA_WAVE_TRI, volRatio: 0.95, hold: 12, decayMult: 1.0 }); // unison body
+              overtones.push({ noteOff: 12, detune: 0.0, wave: VERA_WAVE_TRI, volRatio: 0.88, hold: 10, decayMult: 1.2 });  // octave
+              overtones.push({ noteOff: 7, detune: 0.0, wave: VERA_WAVE_TRI, volRatio: 0.80, hold: 8, decayMult: 1.4 });   // 5th
+            } else {
+              // Mid-bass (A2 to B2, Notes 44..47):
+              overtones.push({ noteOff: 0, detune: 0.35, wave: VERA_WAVE_TRI, volRatio: 0.90, hold: 8, decayMult: 1.0 });  // unison body
+              overtones.push({ noteOff: 12, detune: 0.0, wave: VERA_WAVE_TRI, volRatio: 0.82, hold: 6, decayMult: 1.3 });  // octave
+            }
           }
 
           for (const ot of overtones) {
-            const idleCount = voices.filter(x => x.state === 'IDLE').length;
-            if (idleCount <= 2) break; // keep at least 2 voices free for right hand runs!
             const vOt = allocVoice();
             vOt.role = 'BASS_BODY';
             vOt.parentNote = note;
@@ -487,7 +746,7 @@ for (let f = 0; f < totalFrames; f++) {
             vOt.pan = PAN_C;
             vOt.targetFreq = midiNoteToFreqN(playNote + ot.noteOff, octaveShift, ot.detune);
             vOt.freqWord = vOt.targetFreq;
-            vOt.wave = VERA_WAVE_TRI;
+            vOt.wave = ot.wave || VERA_WAVE_TRI;
             vOt.isNewNote = true;
           }
         }
@@ -521,12 +780,13 @@ for (let f = 0; f < totalFrames; f++) {
         }
       }
     } else if (ev.type === 8 || (ev.type === 9 && ev.d2 === 0)) {
-      // Note Off: release all matching voices (including acoustic resonance bodies) that were held down
+      // Note Off: release all matching voices that were held down
       const note = ev.d1;
       for (const v of voices) {
-        if ((v.note === note || v.parentNote === note) && v.keyHeld) {
+        if (v.keyHeld && (v.ch === ev.ch || v.ch === -1) && (v.note === note || v.parentNote === note)) {
           v.keyHeld = false;
-          if (!sustainPedal) {
+          const usePedal = isEnsemble ? (sustainPedal && v.role === 'CHORD') : sustainPedal;
+          if (!usePedal) {
             v.state = 'RELEASE';
           }
         }
@@ -540,16 +800,43 @@ for (let f = 0; f < totalFrames; f++) {
     if (v.state === 'IDLE') continue;
     v.age++;
 
-    // Hammer attack transient completion:
+    // Kick / Tom rapid pitch dive:
+    if (v.pitchDrop > 0) {
+      v.pitchDrop--;
+      v.targetFreq = Math.round(v.targetFreq * 0.76);
+      v.freqWord = v.targetFreq;
+    }
+
+    // Portamento / pitch slide (e.g. vocal blues scoop bend):
+    if (v.slideFrames > 0) {
+      v.slideFrames--;
+      v.freqWord = Math.round(v.freqWord + v.slideStep);
+    }
+
+    // Hammer / pick attack transient completion:
     if (v.hammerFrames > 0) {
       v.hammerFrames--;
-      if (v.hammerFrames === 0 && v.role === 'PRIMARY') {
-        v.wave = VERA_WAVE_TRI;
+      if (v.hammerFrames === 0) {
+        if (isEnsemble) {
+          if (v.role === 'GUITAR_LEAD') {
+            v.wave = VERA_WAVE_SAW; // crunchy overdriven guitar distortion!
+          } else if (v.role === 'LEAD') {
+            v.wave = VERA_WAVE_PULSE_25; // bright singing lead
+          } else if (v.role === 'BASS') {
+            v.wave = VERA_WAVE_SAW; // growling slap bass
+          }
+        } else if (v.role === 'PRIMARY') {
+          if (synthMode === 'psg') {
+            v.wave = (v.note >= 60) ? VERA_WAVE_PULSE_25 : ((v.note < 48) ? VERA_WAVE_SAW : VERA_WAVE_PULSE_50);
+          } else if (synthMode === 'grand') {
+            v.wave = VERA_WAVE_TRI;
+          }
+        }
         v.vol = v.baseVol;
       }
     }
 
-    // Acoustic Piano Decay Simulation
+    // Acoustic / Synth Decay Simulation
     if (v.holdFrames > 0) {
       v.holdFrames--;
     } else if (v.state === 'HOLD') {
@@ -559,10 +846,17 @@ for (let f = 0; f < totalFrames; f++) {
         v.state = 'IDLE';
       }
     } else if (v.state === 'RELEASE') {
-      // Natural acoustic piano damper felt release:
-      // Bass strings (note < 48) have larger mass and linger naturally for ~1s (0.4/frame).
-      // Mid/treble strings (note >= 48) are cleanly dampened within ~100ms (5.5/frame) for crisp staccato!
-      const relDecay = (v.note < 48) ? 0.40 : 5.5;
+      let relDecay;
+      if (isEnsemble) {
+        if (v.role === 'BASS') relDecay = 4.5;
+        else if (v.role === 'GUITAR_LEAD' || v.role === 'GUITAR_RHYTHM') relDecay = 4.0;
+        else if (v.role === 'LEAD') relDecay = 3.5;
+        else if (v.role === 'CHORD') relDecay = 2.0;
+        else relDecay = 5.0;
+      } else {
+        const isBass = isBassVoice(v);
+        relDecay = isBass ? 0.35 : 5.5;
+      }
       v.vol = Math.max(0, v.vol - relDecay);
       if (v.vol <= 6) {
         v.vol = 0;
@@ -586,7 +880,7 @@ for (let f = 0; f < totalFrames; f++) {
       v.isNewNote = false;
     } else {
       // Frequency update (pitch bend / vibrato if any)
-      if (v.freqWord !== v.lastSentFreq) {
+      if (Math.abs(v.freqWord - v.lastSentFreq) >= 4) {
         writes.push({ reg: chBase + 0, val: v.freqWord & 0xFF });
         writes.push({ reg: chBase + 1, val: (v.freqWord >> 8) & 0xFF });
         v.lastSentFreq = v.freqWord;

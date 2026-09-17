@@ -17,6 +17,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { assembleAsmFile } from "../../veratest/src/asm6502.mjs";
 import { compileApplesoftBasic } from "../../veratest/src/applebasic.mjs";
@@ -70,6 +71,68 @@ const patchTitle = (codeBuf, titleStr, placeholder = "VERA PSG", targetLen = 32)
   }
   return buf;
 };
+
+// Lightweight zero-dependency standard ZIP builder
+function writeSingleFileZip(outZipPath, entryName, dataBuf) {
+  const crc = zlib.crc32(dataBuf);
+  const compressed = zlib.deflateRawSync(dataBuf, { level: 6 });
+  const entryNameBuf = Buffer.from(entryName, "utf8");
+
+  const localHeaderLen = 30 + entryNameBuf.length;
+  const centralHeaderLen = 46 + entryNameBuf.length;
+  const totalLen = localHeaderLen + compressed.length + centralHeaderLen + 22;
+  const zip = Buffer.alloc(totalLen);
+  let pos = 0;
+
+  // Local file header (0x04034b50)
+  zip.writeUInt32LE(0x04034b50, pos); pos += 4;
+  zip.writeUInt16LE(20, pos); pos += 2; // version needed: 2.0
+  zip.writeUInt16LE(0, pos); pos += 2;  // flags
+  zip.writeUInt16LE(8, pos); pos += 2;  // compression: Deflate
+  zip.writeUInt16LE(0, pos); pos += 2;  // mod time
+  zip.writeUInt16LE(0, pos); pos += 2;  // mod date
+  zip.writeUInt32LE(crc, pos); pos += 4;
+  zip.writeUInt32LE(compressed.length, pos); pos += 4;
+  zip.writeUInt32LE(dataBuf.length, pos); pos += 4;
+  zip.writeUInt16LE(entryNameBuf.length, pos); pos += 2;
+  zip.writeUInt16LE(0, pos); pos += 2;  // extra field length
+  entryNameBuf.copy(zip, pos); pos += entryNameBuf.length;
+  compressed.copy(zip, pos); pos += compressed.length;
+
+  const centralOffset = localHeaderLen + compressed.length;
+
+  // Central directory file header (0x02014b50)
+  zip.writeUInt32LE(0x02014b50, pos); pos += 4;
+  zip.writeUInt16LE(20, pos); pos += 2; // version made by: 2.0
+  zip.writeUInt16LE(20, pos); pos += 2; // version needed: 2.0
+  zip.writeUInt16LE(0, pos); pos += 2;  // flags
+  zip.writeUInt16LE(8, pos); pos += 2;  // compression: Deflate
+  zip.writeUInt16LE(0, pos); pos += 2;  // mod time
+  zip.writeUInt16LE(0, pos); pos += 2;  // mod date
+  zip.writeUInt32LE(crc, pos); pos += 4;
+  zip.writeUInt32LE(compressed.length, pos); pos += 4;
+  zip.writeUInt32LE(dataBuf.length, pos); pos += 4;
+  zip.writeUInt16LE(entryNameBuf.length, pos); pos += 2;
+  zip.writeUInt16LE(0, pos); pos += 2;  // extra field length
+  zip.writeUInt16LE(0, pos); pos += 2;  // comment length
+  zip.writeUInt16LE(0, pos); pos += 2;  // disk number
+  zip.writeUInt16LE(0, pos); pos += 2;  // internal file attr
+  zip.writeUInt32LE(0, pos); pos += 4;  // external file attr
+  zip.writeUInt32LE(0, pos); pos += 4;  // local header offset
+  entryNameBuf.copy(zip, pos); pos += entryNameBuf.length;
+
+  // End of central directory record (0x06054b50)
+  zip.writeUInt32LE(0x06054b50, pos); pos += 4;
+  zip.writeUInt16LE(0, pos); pos += 2;  // disk number
+  zip.writeUInt16LE(0, pos); pos += 2;  // start disk
+  zip.writeUInt16LE(1, pos); pos += 2;  // entries on this disk
+  zip.writeUInt16LE(1, pos); pos += 2;  // total entries
+  zip.writeUInt32LE(centralHeaderLen, pos); pos += 4; // size of central dir
+  zip.writeUInt32LE(centralOffset, pos); pos += 4;   // offset of central dir
+  zip.writeUInt16LE(0, pos); pos += 2;  // comment length
+
+  fs.writeFileSync(outZipPath, zip);
+}
 
 const asm = (file, slot, extraLines = []) => {
   const code = assembleAsmFile(srcDir, file, slot, LOAD, extraLines);
@@ -480,6 +543,12 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
       console.warn("  [WARN] jukebox.hdv locked by emulator, wrote jukebox.hdv.new");
     } else throw e;
   }
+
+  // Also automatically generate jukebox.hdv.zip
+  const outHdvZip = path.join(rootDir, "jukebox.hdv.zip");
+  writeSingleFileZip(outHdvZip, "jukebox.hdv", disk);
+  const zipKb = Math.round(fs.statSync(outHdvZip).size / 1024);
+
   let freeHdv = 0; for (let b = 0; b < TOTAL_BLOCKS; b++) if (isFree(b)) freeHdv++;
-  console.log(`[SUCCESS] jukebox.hdv (32MB): ${fileCount} files, FANTAISIE blks 100-${CHOPIN_BLK0 + fantaisieBlks - 1}, BEATIT blks 300-${BEATIT_BLK0 + beatitBlks - 1}, WELLERMAN blks 600-${WELLERMAN_BLK0 + wellermanBlks - 1}, SPACEDB.PCM blks 5000-${SPACE_PCM_BLK0 + spaceDebrisPcmBlks - 1} (${spaceDebrisPcmBlks} blks), ${freeHdv} blks free`);
+  console.log(`[SUCCESS] jukebox.hdv (32MB) & jukebox.hdv.zip (${zipKb} KB): ${fileCount} files, FANTAISIE blks 100-${CHOPIN_BLK0 + fantaisieBlks - 1}, BEATIT blks 300-${BEATIT_BLK0 + beatitBlks - 1}, WELLERMAN blks 600-${WELLERMAN_BLK0 + wellermanBlks - 1}, SPACEDB.PCM blks 5000-${SPACE_PCM_BLK0 + spaceDebrisPcmBlks - 1} (${spaceDebrisPcmBlks} blks), ${freeHdv} blks free`);
 }
