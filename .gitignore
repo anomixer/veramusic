@@ -4,6 +4,20 @@ node_modules/
 # Generated preview audio files (50MB+ uncompressed files)
 *.wav
 
+# Preview / check MP3 clips generated during development (not source assets)
+music/Enya_*.mp3
+music/eurus_*.mp3
+music/high_vocal_isolated.mp3
+music/m4a_*.mp3
+music/synth_*.mp3
+music/*_check.mp3
+music/*_preview.mp3
+music/*_clip.mp3
+music/*_section.mp3
+
+# Raw source audio (large binary, not needed in repo)
+music/*.m4a
+
 # Intermediate emulator files & simulation logs
 *.new
 *.tmp

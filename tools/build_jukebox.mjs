@@ -10,8 +10,9 @@
  *      - Track 1: Melody Demo (RAM PSG, 0:30)
  *      - Track 2: Chopin Fantaisie-Impromptu (Stream PSG from block 100, 5:17)
  *      - Track 3: Michael Jackson: Beat It (Stream PSG from block 300, 3:58)
- *      - Track 4: Space Debris (Stream PCM from block 5000, 5:05)
- *      - Track 5: The Wellerman (Stream PCM from block 600, 2:00)
+ *      - Track 4: Enya: Caribbean Blue (Stream PSG from block 4000, 2:56)
+ *      - Track 5: Space Debris (Stream PCM from block 5000, 5:05)
+ *      - Track 6: The Wellerman (Stream PCM from block 600, 2:00)
  *
  * Zero external dependencies. Uses Apple2TS / veratest 6502 assembler + tokenizer.
  */
@@ -37,6 +38,7 @@ const need = (p, what) => {
 const demoTune = need(path.join(musicDir, "demo.psg"), "demo.psg (run gen_demo + mod2psg first)");
 const fantaisieTune = need(path.join(musicDir, "Fantaisie-impromptu.psg"), "Fantaisie-impromptu.psg (run mid2psg first)");
 const beatitTune = need(path.join(musicDir, "BeatIt.psg"), "BeatIt.psg (run mid2psg BeatIt.mid first)");
+const eurusTune = need(path.join(musicDir, "Enya_Caribbean Blue.psg"), "Enya_Caribbean Blue.psg (run mid2psg first)");
 const spaceDebrisPcm = need(path.join(musicDir, "space_debris.pcm"), "space_debris.pcm (run render_pure_pcm.mjs first)");
 const wellermanTune = need(path.join(musicDir, "wellerman_full.pcm"), "wellerman_full.pcm (run wav2pcm first)");
 
@@ -147,8 +149,8 @@ const testtune2 = Buffer.concat([Buffer.from(playCode2), demoTune]);
 const testtune4 = Buffer.concat([Buffer.from(playCode4), demoTune]);
 
 // 2. Stream Player for Chopin (Starts at block 100)
-const streamChopin2 = patchTitle(asm("psgstream.asm", 2, ["STREAM_BLK0 = 100"]), "CHOPIN: FANTAISIE-IMPROMPTU (5:02)", "VERA PSG STREAM", 40);
-const streamChopin4 = patchTitle(asm("psgstream.asm", 4, ["STREAM_BLK0 = 100"]), "CHOPIN: FANTAISIE-IMPROMPTU (5:02)", "VERA PSG STREAM", 40);
+const streamChopin2 = patchTitle(asm("psgstream.asm", 2, ["STREAM_BLK0 = 100"]), "CHOPIN: FANTAISIE IMPROMPTU (5:02)", "VERA PSG STREAM", 40);
+const streamChopin4 = patchTitle(asm("psgstream.asm", 4, ["STREAM_BLK0 = 100"]), "CHOPIN: FANTAISIE IMPROMPTU (5:02)", "VERA PSG STREAM", 40);
 
 // 2b. VERA VRAM Pre-Load Player for Chopin on Floppy Disk (jukebox.po): eliminates floppy read pauses!
 const fantaisieBlks = Math.ceil(fantaisieTune.length / 512);
@@ -165,7 +167,13 @@ const vramChopin4 = asm("psgvram.asm", 4, [
 const streamBeat2 = patchTitle(asm("psgstream.asm", 2, ["STREAM_BLK0 = 300"]), "M. JACKSON: BEAT IT (3:58)", "VERA PSG STREAM", 40);
 const streamBeat4 = patchTitle(asm("psgstream.asm", 4, ["STREAM_BLK0 = 300"]), "M. JACKSON: BEAT IT (3:58)", "VERA PSG STREAM", 40);
 
-// 4. Stream PCM Player for Space Debris (Track 4: Starts at block 5000, 5:05)
+// 4. Stream Player for Enya: Caribbean Blue (Starts at block 4000)
+const eurusBlks = Math.ceil(eurusTune.length / 512);
+const EURUS_BLK0 = 4000;
+const streamEurus2 = patchTitle(asm("psgstream.asm", 2, [`STREAM_BLK0 = ${EURUS_BLK0}`]), "ENYA: CARIBBEAN BLUE (2:56)", "VERA PSG STREAM", 40);
+const streamEurus4 = patchTitle(asm("psgstream.asm", 4, [`STREAM_BLK0 = ${EURUS_BLK0}`]), "ENYA: CARIBBEAN BLUE (2:56)", "VERA PSG STREAM", 40);
+
+// 5. Stream PCM Player for Space Debris (Track 5: Starts at block 5000, 5:05)
 const spaceDebrisPcmBlks = Math.ceil(spaceDebrisPcm.length / 512);
 const SPACE_PCM_BLK0 = 5000;
 const pcmdeb2 = patchTitle(asm("pcmstream.asm", 2, [
@@ -179,7 +187,7 @@ const pcmdeb4 = patchTitle(asm("pcmstream.asm", 4, [
   "RATE_VAL = 21"
 ]), "CAPTAIN: SPACE DEBRIS (5:05)", "A. NAKARADA: THE WELLERMAN", 40);
 
-// 5. Stream Player for Alexander Nakarada - The Wellerman (Starts at block 600, FULL 2:00 SONG)
+// 6. Stream Player for Alexander Nakarada - The Wellerman (Starts at block 600, FULL 2:00 SONG)
 const wellermanBlks = Math.ceil(wellermanTune.length / 512);
 const pcmwel2 = asm("pcmstream.asm", 2, [
   "STREAM_BLK0 = 600",
@@ -196,6 +204,7 @@ for (const [c, n] of [
   [streamChopin2, "streamChopin2"], [streamChopin4, "streamChopin4"],
   [vramChopin2, "vramChopin2"],     [vramChopin4, "vramChopin4"],
   [streamBeat2, "streamBeat2"],     [streamBeat4, "streamBeat4"],
+  [streamEurus2, "streamEurus2"],   [streamEurus4, "streamEurus4"],
   [pcmdeb2, "pcmdeb2"],             [pcmdeb4, "pcmdeb4"],
   [pcmwel2, "pcmwel2"],             [pcmwel4, "pcmwel4"]
 ]) {
@@ -326,7 +335,7 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
     } else throw e;
   }
   let freePo = 0; for (let b = 0; b < 280; b++) if (isFree(b)) freePo++;
-  console.log(`[SUCCESS] jukebox.po  (140KB): ${fileCount} files, FANTAISIE.PSG blks 100-${STREAM_BLK0 + streamBlks - 1} (${streamBlks} blks), ${freePo} blks free`);
+  console.log(`[SUCCESS] jukebox.po  (140KB): ${fileCount} files, FANTAISIE.PSG blks ${STREAM_BLK0}-${STREAM_BLK0 + streamBlks - 1} (${streamBlks} blks), ${freePo} blks free`);
 }
 
 // ============================================================================
@@ -375,8 +384,9 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
   // 3. Pre-reserve contiguous block ranges for the streaming tracks:
   //    Track 2 (Chopin):        blocks 100..100+fantaisieBlks-1
   //    Track 3 (Beat It):       blocks 300..300+beatitBlks-1 (FULL 3:58 SONG!)
-  //    Track 5 (Wellerman):     blocks 600..600+wellermanBlks-1 (FULL 2:00 SONG!)
-  //    Track 4 (Space Debris):  blocks 5000..5000+spaceDebrisPcmBlks-1 (100% Pure PCM)
+  //    Track 6 (Wellerman):     blocks 600..600+wellermanBlks-1 (FULL 2:00 SONG!)
+  //    Track 4 (Enya):          blocks 4000..4000+eurusBlks-1
+  //    Track 5 (Space Debris):  blocks 5000..5000+spaceDebrisPcmBlks-1 (100% Pure PCM)
   const fantaisieBlks = Math.ceil(fantaisieTune.length / 512);
   const beatitBlks = Math.ceil(beatitTune.length / 512);
   const CHOPIN_BLK0 = 100;
@@ -386,6 +396,7 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
   for (let b = CHOPIN_BLK0; b < CHOPIN_BLK0 + fantaisieBlks; b++) markUsed(b);
   for (let b = BEATIT_BLK0; b < BEATIT_BLK0 + beatitBlks; b++) markUsed(b);
   for (let b = WELLERMAN_BLK0; b < WELLERMAN_BLK0 + wellermanBlks; b++) markUsed(b);
+  for (let b = EURUS_BLK0; b < EURUS_BLK0 + eurusBlks; b++) markUsed(b);
   for (let b = SPACE_PCM_BLK0; b < SPACE_PCM_BLK0 + spaceDebrisPcmBlks; b++) markUsed(b);
 
   // Write streaming audio payloads into disk blocks
@@ -400,6 +411,10 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
   for (let i = 0; i < wellermanBlks; i++) {
     const db = WELLERMAN_BLK0 + i;
     disk.set(wellermanTune.subarray(i * 512, Math.min(wellermanTune.length, (i + 1) * 512)), db * 512);
+  }
+  for (let i = 0; i < eurusBlks; i++) {
+    const db = EURUS_BLK0 + i;
+    disk.set(eurusTune.subarray(i * 512, Math.min(eurusTune.length, (i + 1) * 512)), db * 512);
   }
   for (let i = 0; i < spaceDebrisPcmBlks; i++) {
     const db = SPACE_PCM_BLK0 + i;
@@ -471,6 +486,8 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
   addFile("STREAM4.BIN", 0x06, 0x2000, vramChopin4);
   addFile("BEATIT.BIN", 0x06, 0x2000, streamBeat2);
   addFile("BEATIT4.BIN", 0x06, 0x2000, streamBeat4);
+  addFile("CARIBBEAN.BIN", 0x06, 0x2000, streamEurus2);
+  addFile("CARIBBEAN4.BIN", 0x06, 0x2000, streamEurus4);
   addFile("PCMDEB.BIN", 0x06, 0x2000, pcmdeb2);
   addFile("PCMDEB4.BIN", 0x06, 0x2000, pcmdeb4);
   addFile("PCMWEL.BIN", 0x06, 0x2000, pcmwel2);
@@ -492,6 +509,14 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
     beatitIx[i] = db & 0xFF; beatitIx[i + 256] = (db >> 8) & 0xFF;
   }
   addDirEntry("BEATIT.PSG", 0x00, 0x0000, beatitTune.length, 2, beatitKey, 1 + beatitBlks);
+
+  const eurusKey = alloc();
+  const eurusIx = disk.subarray(eurusKey * 512, (eurusKey + 1) * 512);
+  for (let i = 0; i < eurusBlks; i++) {
+    const db = EURUS_BLK0 + i;
+    eurusIx[i] = db & 0xFF; eurusIx[i + 256] = (db >> 8) & 0xFF;
+  }
+  addDirEntry("CARIBBEAN.PSG", 0x00, 0x0000, eurusTune.length, 2, eurusKey, 1 + eurusBlks);
 
   // Add tree file index blocks for SPACEDB.PCM (CATALOG visibility)
   const debMasterKey = alloc();
@@ -550,5 +575,5 @@ const startupHdvCode = compileApplesoftBasic(srcDir, "startup.bas");
   const zipKb = Math.round(fs.statSync(outHdvZip).size / 1024);
 
   let freeHdv = 0; for (let b = 0; b < TOTAL_BLOCKS; b++) if (isFree(b)) freeHdv++;
-  console.log(`[SUCCESS] jukebox.hdv (32MB) & jukebox.hdv.zip (${zipKb} KB): ${fileCount} files, FANTAISIE blks 100-${CHOPIN_BLK0 + fantaisieBlks - 1}, BEATIT blks 300-${BEATIT_BLK0 + beatitBlks - 1}, WELLERMAN blks 600-${WELLERMAN_BLK0 + wellermanBlks - 1}, SPACEDB.PCM blks 5000-${SPACE_PCM_BLK0 + spaceDebrisPcmBlks - 1} (${spaceDebrisPcmBlks} blks), ${freeHdv} blks free`);
+  console.log(`[SUCCESS] jukebox.hdv (32MB) & jukebox.hdv.zip (${zipKb} KB): ${fileCount} files, FANTAISIE blks 100-${CHOPIN_BLK0 + fantaisieBlks - 1}, BEATIT blks 300-${BEATIT_BLK0 + beatitBlks - 1}, WELLERMAN blks 600-${WELLERMAN_BLK0 + wellermanBlks - 1}, EURUS blks 4000-${EURUS_BLK0 + eurusBlks - 1}, SPACEDB.PCM blks 5000-${SPACE_PCM_BLK0 + spaceDebrisPcmBlks - 1} (${spaceDebrisPcmBlks} blks), ${freeHdv} blks free`);
 }

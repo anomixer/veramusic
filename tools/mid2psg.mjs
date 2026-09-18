@@ -149,7 +149,7 @@ const midiBuf = readFileSync(midiPath);
 const parsedMidi = parseMidi(midiBuf);
 
 // Merge tracks into a time-sorted event queue
-const allEvents = [];
+let allEvents = [];
 for (const trk of parsedMidi.tracks) {
   allEvents.push(...parseTrackEvents(trk));
 }
@@ -243,6 +243,114 @@ if (baseName.toLowerCase().includes('beatit')) {
   }
 }
 
+const isNewAge = baseName.toLowerCase().includes('enya') || baseName.toLowerCase().includes('caribbean') || synthMode === 'newage';
+
+if (isNewAge) {
+  // Fix 0:09, 1:17, 2:11, 2:28, 2:45 phrase end notes ("句尾 平音~升音-平音~(錯) => 平音~升音-降音"):
+  // In the original MIDI:
+  // 0:09: tick 8092: D#4 (63), tick 8854: E4 (64), tick 9220: D#4 (63) (平音 - 錯) -> NoteOff: tick 10098
+  // 1:17: tick 81804: D#4 (63), tick 82560: E4 (64), tick 82932: D#4 (63) (平音 - 錯) -> NoteOff: tick 83858
+  // 2:11: tick 140544: E4 (64), tick 141328: F4 (65), tick 141708: E4 (64) (平音 - 錯) -> NoteOff: tick 142870
+  // 2:28: tick 158972: E4 (64), tick 159774: F4 (65), tick 160134: E4 (64) (平音 - 錯) -> NoteOff: tick 161314
+  // 2:45: tick 177420: E4 (64), tick 178200: F4 (65), tick 178546: E4 (64) (平音 - 錯) -> NoteOff: tick 179736
+  const enyaVer = parseInt((argv.find(a => a.startsWith('--enya-ver=')) || '--enya-ver=2').split('=')[1], 10) || 2;
+  let endNote = 61; // Default Ver 2: C#4 (61) — chosen by user ("平音~升音-降音")
+  if (enyaVer === 1) endNote = 59; // Ver 1: B3 (59)
+  else if (enyaVer === 3) endNote = 57; // Ver 3: A3 (57)
+  else if (enyaVer === 4) endNote = 62; // Ver 4: D4 (62)
+
+  const outroEndNote = (endNote === 61) ? 62 : (endNote === 59 ? 60 : (endNote === 57 ? 58 : 63)); // Ver 2 outro: D4 (62)
+
+  for (const ev of allEvents) {
+    if (ev.ch === 2) {
+      // 0:06, 0:14, 1:14, 1:22 下滑4個音 (E4->D#4->C#4->B3), 第4個音 (B3, note 59) 不用短促伴奏音, 保持主旋律唱歌音色與延音:
+      if (ev.d1 === 59 && (ev.tick === 6326 || ev.tick === 15520 || ev.tick === 80064 || ev.tick === 89294)) {
+        ev.isMelody = true;
+      }
+
+      if (enyaVer === 5) {
+        if (ev.tick === 8092 && ev.type === 9 && ev.d2 > 0) ev.d1 = 61;
+        if (ev.tick === 8854 && ev.type === 9 && ev.d2 > 0) ev.d1 = 63;
+        if (ev.tick === 9220 && ev.type === 9 && ev.d2 > 0) ev.d1 = 59;
+        if (ev.tick === 10098 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) ev.d1 = 59;
+        if (ev.tick === 81804 && ev.type === 9 && ev.d2 > 0) ev.d1 = 61;
+        if (ev.tick === 82560 && ev.type === 9 && ev.d2 > 0) ev.d1 = 63;
+        if (ev.tick === 82932 && ev.type === 9 && ev.d2 > 0) ev.d1 = 59;
+        if (ev.tick === 83858 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) ev.d1 = 59;
+      } else {
+        // 0:09 phrase end
+        if (ev.tick === 9220 && (ev.type === 9 && ev.d2 > 0)) ev.d1 = endNote;
+        if (ev.tick === 10098 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) ev.d1 = endNote;
+        // 1:17 phrase end
+        if (ev.tick === 82932 && (ev.type === 9 && ev.d2 > 0)) ev.d1 = endNote;
+        if (ev.tick === 83858 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) ev.d1 = endNote;
+        // 2:11 phrase end (transposed section: E4 -> D4)
+        if (ev.tick === 141708 && (ev.type === 9 && ev.d2 > 0)) ev.d1 = outroEndNote;
+        if (ev.tick === 142870 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) {
+          // Release note 141708 before note 142844 starts so 142844 plays its full 0.92s sustain (跟2:04一樣長, 不再短促)!
+          ev.tick = 142843;
+          ev.d1 = outroEndNote;
+        }
+        // 2:28 phrase end (transposed section: E4 -> D4)
+        if (ev.tick === 160134 && (ev.type === 9 && ev.d2 > 0)) ev.d1 = outroEndNote;
+        if (ev.tick === 161314 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) {
+          ev.tick = 161287;
+          ev.d1 = outroEndNote;
+        }
+        // 2:45 phrase end (transposed section: E4 -> D4)
+        if (ev.tick === 178546 && (ev.type === 9 && ev.d2 > 0)) ev.d1 = outroEndNote;
+        if (ev.tick === 179736 && (ev.type === 8 || (ev.type === 9 && ev.d2 === 0))) {
+          ev.tick = 179713;
+          ev.d1 = outroEndNote;
+        }
+      }
+    }
+  }
+
+  // In the Outro (tick >= 134784, 2:05 onwards):
+  // Filter out Track 3 (12-String Guitar) to completely eliminate all interfering 25% pulse-wave chimes!
+  allEvents = allEvents.filter(ev => !(ev.ch === 3 && ev.tick >= 134784));
+
+  // 2:05 Outro High Vocal Choir Harmony:
+  // "1. 第一個超高超高 要跟隨主旋 (你有點慢了半拍) -> Beat 1 即刻切入
+  //  2. nana 聲音要再大聲~ 跟主旋同等級
+  //  3. 那個 平平 太低, 音高要再高一點 -> G5 (79)
+  //  其他地方別亂chime, 後面依此類推"
+  const addHighChoir = !argv.includes('--no-high-choir');
+  if (addHighChoir) {
+    const newChoirEvents = [];
+    const startTick = 134784; // 2:05 in MIDI (starts with Eurus)
+    const phraseStarts = [0, 8, 16, 24, 32, 40];
+    // Bar 0: 超高=86 (D6), Bar 1: 高=81 (A5), Bar 2: 平=79 (G5, 調高2個半音匹配Gm且更加開闊)
+    const phraseNotes = [86, 81, 79];
+
+    for (const p of phraseStarts) {
+      const fadeMult = (p >= 40) ? 0.6 : 1.0;
+
+      for (let barOffset = 0; barOffset < 3; barOffset++) {
+        const barIdx = p + barOffset;
+        if (barIdx > 43) break;
+        const mTick = startTick + barIdx * 1152;
+        const note = phraseNotes[barOffset];
+
+        // Beat 1: 第一個音 (跟隨主旋律同步在第一拍切入)
+        const b1Tick = mTick + 0;
+        const v1 = Math.round(96 * fadeMult);
+        newChoirEvents.push({ tick: b1Tick, time: tickToSeconds(b1Tick), type: 9, ch: 6, d1: note, d2: v1, pan: PAN_C });
+        newChoirEvents.push({ tick: b1Tick + 360, time: tickToSeconds(b1Tick + 360), type: 8, ch: 6, d1: note, d2: 64, pan: PAN_C });
+
+        // Beat 2: 第二個音 (第二拍切入並持續延音貫穿第三拍)
+        const b2Tick = mTick + 384;
+        const v2 = Math.round(90 * fadeMult);
+        newChoirEvents.push({ tick: b2Tick, time: tickToSeconds(b2Tick), type: 9, ch: 6, d1: note, d2: v2, pan: PAN_C });
+        newChoirEvents.push({ tick: b2Tick + 720, time: tickToSeconds(b2Tick + 720), type: 8, ch: 6, d1: note, d2: 64, pan: PAN_C });
+      }
+    }
+    allEvents.push(...newChoirEvents);
+    allEvents.sort((a, b) => a.tick - b.tick);
+  }
+}
+
 // ---------------- Polyphonic PSG Voice Engine ----------------
 const FPS = 60;
 const totalFrames = Math.ceil(totalDuration * FPS) + 30; // +0.5s tail for acoustic release
@@ -255,7 +363,7 @@ const chBend = new Array(16).fill(0);
 const voices = Array.from({ length: maxVoices }, (_, i) => ({
   id: i,
   state: 'IDLE', // 'IDLE', 'HOLD', 'RELEASE'
-  role: 'PRIMARY', // 'PRIMARY', 'CHORUS', 'BASS_BODY', 'DRUM', 'BASS', 'GUITAR_LEAD', 'GUITAR_RHYTHM', 'LEAD', 'CHORD'
+  role: 'PRIMARY', // 'PRIMARY', 'CHORUS', 'BASS_BODY', 'DRUM', 'BASS', 'GUITAR_LEAD', 'GUITAR_RHYTHM', 'LEAD', 'CHORD', 'CHOIR', 'NEWAGE_BASS', 'ACOUSTIC_GTR', 'ARPEGGIO', 'PIANO'
   parentNote: -1,
   note: -1,
   ch: -1,
@@ -280,21 +388,37 @@ const voices = Array.from({ length: maxVoices }, (_, i) => ({
 }));
 
 function isBassVoice(x) {
-  return x.role === 'BASS_BODY' || (x.parentNote >= 0 && x.parentNote < 48) || (x.role === 'PRIMARY' && x.note < 48);
+  return x.role === 'BASS_BODY' || x.role === 'NEWAGE_BASS' || (x.parentNote >= 0 && x.parentNote < 48) || (x.role === 'PRIMARY' && x.note < 48);
 }
 
 function getInstrumentRole(ch, note) {
   if (ch === 9) return 'DRUM';
   const prog = chProg[ch];
-  if (ch === 1 || (prog >= 32 && prog <= 39)) return 'BASS';
-  if (ch === 3 || ch === 4 || prog === 29 || prog === 30) return 'GUITAR_LEAD';
-  if (ch === 5 || ch === 6 || prog === 27 || prog === 28) return 'GUITAR_RHYTHM';
-  if (ch === 0 || ch === 10 || (prog >= 52 && prog <= 55) || (prog >= 80 && prog <= 87)) return 'LEAD';
+  if (isNewAge) {
+    if (ch === 1 || (prog >= 32 && prog <= 39)) return 'NEWAGE_BASS';
+    if (ch === 6) return 'HIGH_CHOIR';
+    if (ch === 4 || (prog >= 52 && prog <= 55)) return 'CHOIR';
+    if (ch === 3 || prog === 24 || prog === 25) return 'ACOUSTIC_GTR';
+    if (ch === 5 || prog === 7 || (prog >= 8 && prog <= 15)) return 'ARPEGGIO';
+    if (ch === 2 || (prog >= 0 && prog <= 5)) return 'PIANO';
+    return 'CHORD';
+  }
+  if (baseName.toLowerCase().includes('beatit')) {
+    if (ch === 1 || (prog >= 32 && prog <= 39)) return 'BASS';
+    if (ch === 3 || ch === 4 || prog === 29 || prog === 30) return 'GUITAR_LEAD';
+    if (ch === 5 || ch === 6 || prog === 27 || prog === 28) return 'GUITAR_RHYTHM';
+    if (ch === 0 || ch === 10 || (prog >= 52 && prog <= 55) || (prog >= 80 && prog <= 87)) return 'LEAD';
+    return 'CHORD';
+  }
+  if (prog >= 32 && prog <= 39) return 'BASS';
+  if (prog >= 24 && prog <= 31) return 'ACOUSTIC_GTR';
+  if (prog >= 52 && prog <= 55) return 'CHOIR';
+  if (prog >= 0 && prog <= 7) return 'PIANO';
   return 'CHORD';
 }
 
 function allocEnsembleVoice(role, ch) {
-  // If BASS: recycle existing voice on this channel for monophonic driving bass line!
+  // If BASS (monophonic bass lines e.g. Beat It): recycle existing voice on this channel
   if (role === 'BASS') {
     const prevBass = voices.find(x => x.ch === ch && x.state !== 'IDLE');
     if (prevBass) return prevBass;
@@ -304,16 +428,20 @@ function allocEnsembleVoice(role, ch) {
   let v = voices.find(x => x.state === 'IDLE');
   if (v) return v;
 
-  // 2. Released voices (quietest first)
+  // 2. Released voices (quietest first, protect CHOIR and HIGH_CHOIR)
   const relVoices = voices.filter(x => x.state === 'RELEASE');
-  if (relVoices.length > 0) return relVoices.reduce((m, x) => (x.vol < m.vol ? x : m));
+  if (relVoices.length > 0) {
+    const nonChoir = relVoices.filter(x => x.role !== 'CHOIR' && x.role !== 'HIGH_CHOIR');
+    if (nonChoir.length > 0) return nonChoir.reduce((m, x) => (x.vol < m.vol ? x : m));
+    return relVoices.reduce((m, x) => (x.vol < m.vol ? x : m));
+  }
 
-  // 3. Non-critical background voices (CHORD / GUITAR_RHYTHM) sounding > 6 frames
-  const nonCrit = voices.filter(x => (x.role === 'CHORD' || x.role === 'GUITAR_RHYTHM') && x.age > 6);
+  // 3. Non-critical background voices (CHORD / GUITAR_RHYTHM / ARPEGGIO) sounding > 6 frames
+  const nonCrit = voices.filter(x => (x.role === 'CHORD' || x.role === 'GUITAR_RHYTHM' || x.role === 'ARPEGGIO') && x.age > 6);
   if (nonCrit.length > 0) return nonCrit.reduce((m, x) => (x.vol < m.vol ? x : m));
 
-  // 4. Any voice that is not DRUM and not BASS, sounding > 8 frames
-  const oldVoices = voices.filter(x => x.role !== 'DRUM' && x.role !== 'BASS' && x.age > 8);
+  // 4. Any voice that is not DRUM, BASS, or CHOIR, sounding > 8 frames
+  const oldVoices = voices.filter(x => x.role !== 'DRUM' && x.role !== 'BASS' && x.role !== 'NEWAGE_BASS' && x.role !== 'CHOIR' && x.age > 8);
   if (oldVoices.length > 0) return oldVoices.reduce((m, x) => (x.vol < m.vol ? x : m));
 
   // 5. Any voice that is not a fresh drum hit (age > 2)
@@ -530,7 +658,79 @@ for (let f = 0; f < totalFrames; f++) {
           v1.slideStep = (targetFreq - startFreq) / bendFrames;
         }
 
-        if (role === 'BASS') {
+        if (role === 'NEWAGE_BASS') {
+          // Channel 1 (Patch 37 Bass):
+          // Pure Triangle wave (VERA_WAVE_TRI): warm, organic, deep, zero buzz!
+          v1.wave = VERA_WAVE_TRI;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(52, Math.round(38 + 14 * norm));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 6;
+          v1.decayRate = 0.16;
+          v1.pan = PAN_C;
+        } else if (role === 'CHOIR') {
+          // Channel 4 (Patch 52 Choir Aahs - Enya's iconic vocal melody):
+          // Pure Triangle wave (VERA_WAVE_TRI): angelic, singing, 100% in-tune pitch!
+          v1.wave = VERA_WAVE_TRI;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(63, Math.round(54 + 9 * Math.pow(norm, 0.35)));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 24;
+          v1.decayRate = 0.04;
+          v1.pan = PAN_C;
+        } else if (role === 'HIGH_CHOIR') {
+          // Channel 6 (Outro backing choir - Na.na~ Na.na~ Na.na):
+          // Pure Triangle wave (VERA_WAVE_TRI): soaring, singing, slightly under lead vocal for perfect balance!
+          v1.wave = VERA_WAVE_TRI;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(46, Math.round((44 + 13 * Math.pow(norm, 0.35)) * 0.8));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 18;
+          v1.decayRate = 0.05;
+          v1.pan = (ev.pan !== undefined) ? ev.pan : PAN_C;
+        } else if (role === 'ACOUSTIC_GTR') {
+          // Channel 3 (Patch 25 +12Str Gtr - 12-string guitar shimmering arpeggios):
+          // 25% pulse wave: bright, singing, bell-like acoustic chime, panned right!
+          v1.wave = VERA_WAVE_PULSE_25;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(48, Math.round(34 + 14 * norm));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 4;
+          v1.decayRate = 0.16;
+          v1.pan = PAN_R;
+        } else if (role === 'ARPEGGIO') {
+          // Channel 5 (Patch 7 Clavinet - delicate waltz accompaniment):
+          // 50% square wave (VERA_WAVE_PULSE_50): warm, soft, non-buzzing, panned left!
+          v1.wave = VERA_WAVE_PULSE_50;
+          v1.hammerFrames = 0;
+          v1.baseVol = Math.min(36, Math.round(22 + 14 * norm));
+          v1.vol = v1.baseVol;
+          v1.holdFrames = 2;
+          v1.decayRate = 0.28;
+          v1.pan = PAN_L;
+        } else if (role === 'PIANO') {
+          // Channel 2 (Patch 0 A. Piano 1 - piano melody & waltz accompaniment):
+          // Accompaniment chords (< 60): Pure Triangle wave (soft felt piano, zero buzz)
+          // Melody & upper register (>= 60 or melody run): Warm 50% square wave (singing wooden piano tone!)
+          const isMelodyPiano = note >= 60 || ev.isMelody;
+          if (!isMelodyPiano) {
+            v1.wave = VERA_WAVE_TRI;
+            v1.hammerFrames = 0;
+            v1.baseVol = Math.min(38, Math.round(24 + 14 * norm));
+            v1.vol = v1.baseVol;
+            v1.holdFrames = 3;
+            v1.decayRate = 0.20;
+            v1.pan = PAN_C;
+          } else {
+            v1.wave = VERA_WAVE_PULSE_50;
+            v1.hammerFrames = 0;
+            v1.baseVol = Math.min(58, Math.round(44 + 14 * norm));
+            v1.vol = v1.baseVol;
+            v1.holdFrames = 6;
+            v1.decayRate = 0.12;
+            v1.pan = PAN_C;
+          }
+        } else if (role === 'BASS') {
           // Funk / Slap Bass (Ch 1 / GM 32..39):
           // Punchy Sawtooth wave with growl and slap bite!
           v1.wave = VERA_WAVE_SAW;
@@ -818,7 +1018,11 @@ for (let f = 0; f < totalFrames; f++) {
       v.hammerFrames--;
       if (v.hammerFrames === 0) {
         if (isEnsemble) {
-          if (v.role === 'GUITAR_LEAD') {
+          if (v.role === 'ACOUSTIC_GTR') {
+            v.wave = VERA_WAVE_PULSE_25;
+          } else if (v.role === 'PIANO') {
+            v.wave = (v.note < 50) ? VERA_WAVE_PULSE_50 : VERA_WAVE_PULSE_25;
+          } else if (v.role === 'GUITAR_LEAD') {
             v.wave = VERA_WAVE_SAW; // crunchy overdriven guitar distortion!
           } else if (v.role === 'LEAD') {
             v.wave = VERA_WAVE_PULSE_25; // bright singing lead
@@ -848,11 +1052,15 @@ for (let f = 0; f < totalFrames; f++) {
     } else if (v.state === 'RELEASE') {
       let relDecay;
       if (isEnsemble) {
-        if (v.role === 'BASS') relDecay = 4.5;
+        if (v.role === 'BASS' || v.role === 'NEWAGE_BASS') relDecay = 2.5;
+        else if (v.role === 'CHOIR') relDecay = 1.0; // ethereal airy decay
+        else if (v.role === 'HIGH_CHOIR') relDecay = 1.8;
+        else if (v.role === 'ACOUSTIC_GTR' || v.role === 'ARPEGGIO') relDecay = 3.0;
+        else if (v.role === 'PIANO') relDecay = 3.2;
         else if (v.role === 'GUITAR_LEAD' || v.role === 'GUITAR_RHYTHM') relDecay = 4.0;
         else if (v.role === 'LEAD') relDecay = 3.5;
         else if (v.role === 'CHORD') relDecay = 2.0;
-        else relDecay = 5.0;
+        else relDecay = 4.0;
       } else {
         const isBass = isBassVoice(v);
         relDecay = isBass ? 0.35 : 5.5;

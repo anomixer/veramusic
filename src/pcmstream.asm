@@ -594,6 +594,14 @@ SHOW_STATUS:
     LDA #$D0              ; 'P'
     STA $07E7
 NO_PAUSED:
+    ; Blank padding for columns 24..39 ($07E8..$07F7)
+    LDA #$A0
+    LDX #$00
+CLR_TAIL_PCM:
+    STA $07E8,X
+    INX
+    CPX #$10
+    BNE CLR_TAIL_PCM
     RTS
 
 HEX_TO_DEC:

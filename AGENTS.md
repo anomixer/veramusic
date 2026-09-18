@@ -413,6 +413,61 @@ The VERA card on Apple II provides:
   - Automatically deflates the 32MB `jukebox.hdv` into `jukebox.hdv.zip` (~2.7 MB, 92% compression) in only ~150 ms upon build completion.
   - Seamlessly integrated into `build.bat`, `build.bat quick`, and `tools/build_jukebox.mjs`.
 
+### Milestone 27: Enya — Caribbean Blue MIDI Integration & Nana Vocal Synthesis
+- **User Request**: Add Enya's *Caribbean Blue* (`Enya_Caribbean Blue.mid`) as Track 4 on `jukebox.hdv`.
+- **MIDI Arrangement (`tools/mid2psg.mjs`)**:
+  - Multi-track ensemble mode (`isEnsemble`) with 7 MIDI channels covering piano, waltz accompaniment, 12-string guitar arpeggio, choir pad, and high-choir vocals.
+  - **Instrument Roles & Waveforms**:
+    - `PIANO` (Ch 2): 50% pulse singing envelope for melody notes (`note >= 60`, `isMelody`); soft triangle for lower accompaniment.
+    - `CHOIR` (Ch 4): Pure Triangle wave choir pad, panned center, warm sustain.
+    - `HIGH_CHOIR` (Ch 6): Pure Triangle wave, 3-note rising nana phrases (`超高~超高 / 高~高 / 平~平`) triggered at precise tick positions (2:05, 2:06, 2:07 and reprise). Pan, pitch and volume tuned per phrase.
+    - `ACOUSTIC_GTR` (Ch 3): 25% pulse shimmer arpeggios, panned right.
+    - `ARPEGGIO` (Ch 5): 50% pulse soft waltz pattern, panned left.
+  - **Melodic B3 Tagging**: The recurring 4-note descending run (E4→D#4→C#4→**B3**) had its B3 instances (`note 59`, ticks 6326/15520/80064/89294) tagged `isMelody = true` so they receive the singing envelope rather than the short accompaniment treatment.
+  - **Nana Phrase Precision**:
+    - First two `超高~超高` nana notes on-beat with main melody (no lag).
+    - `平平` pitch raised for proper harmonic balance.
+    - Shorter-note (2:12 pattern) nana notes given full hold length matching the 2:04 phrase.
+    - Spurious chime notes outside the defined nana windows suppressed.
+  - **Nana Volume**: `HIGH_CHOIR` `baseVol` reduced by 20% (`Math.min(46, Math.round((44 + 13 * norm^0.35) * 0.8))`) to sit naturally under the main vocal lead.
+- **Disk Integration (`tools/build_jukebox.mjs` & `src/startup.bas`)**:
+  - `Enya_Caribbean Blue.psg` (77,011 bytes, 151 blocks) placed at contiguous disk blocks `EURUS_BLK0 = 4000` (blks 4000–4150).
+  - Player binaries `CARIBBEAN.BIN` / `CARIBBEAN4.BIN` compiled via `psgstream.asm` with title `ENYA: CARIBBEAN BLUE (2:56)`.
+  - `CARIBBEAN.PSG` catalog entry added for directory visibility.
+  - **Jukebox menu** (title-only, no artist names in menu; artist names appear during playback):
+    - 1. MELODY DEMO (0:30, RAM PSG)
+    - 2. FANTAISIE IMPROMPTU (5:02, VRAM PSG)
+    - 3. BEAT IT (3:58, STREAM PSG)
+    - 4. CARIBBEAN BLUE (2:56, STREAM PSG)
+    - 5. SPACE DEBRIS (5:05, STREAM PCM)
+    - 6. THE WELLERMAN (2:00, STREAM PCM)
+    - 7. EXIT TO BASIC
+  - `jukebox.hdv` (32MB): 21 files, 58,110 free blocks. `jukebox.hdv.zip` ~2762 KB.
+
+### Milestone 28: Release R6 — 16-Channel Voice Meter & Status Display Overhaul (2026-09-19)
+- **Version Tag Bump**:
+  - `src/startup.bas` & `src/startup_po.bas`: Title updated to `"VERA PSG/PCM JUKEBOX R6 FOR APPLE II"`.
+  - `src/psgplay.asm` & `src/psgstream.asm`: Internal `TITLE` banner rev bumped to `R6`.
+- **Real-Time 16-Channel Activity Meter (`T: mm:ss.c [##=#==^===......] V:15`)**:
+  - Replaced the raw block counter on PSG stream tracks with an authentic 16-voice activity meter matching native `psgplay.exe`.
+  - Implemented across all PSG players: `psgstream.asm` (HDV Chopin, Beat It, Caribbean Blue), `psgvram.asm` (Floppy Chopin), and `psgplay.asm` (Melody Demo).
+  - 5-tier dynamic volume thresholds mapping register bits 5:0 (0..63):
+    - `.` (0: Silent / Inactive)
+    - `-` (1..14: Quiet)
+    - `=` (15..34: Medium)
+    - `#` (35..49: Loud)
+    - `^` (50..63: Peak)
+  - Display spacing: 1 space between tenth digit `c` and `[`.
+- **PCM Stream Track Block Display (`T: mm:ss.c B:xxxx V:15`)**:
+  - Pure 8-bit PCM streaming tracks (*Space Debris*, *The Wellerman*) retain the 4-digit hexadecimal ProDOS disk block counter `B:xxxx`.
+  - Added clean space tail padding across row 23 columns 24..39 ($07E8..$07F7).
+- **6502 Player Assembly Optimization & Floppy Alignment Fix**:
+  - Unified decimal conversion helper (`DIV10`) in `psgplay.asm` and `psgvram.asm`, reducing code footprint by 30+ bytes.
+  - Kept `testtune2` under the 5632-byte boundary (11 blocks), saving 2 blocks on the 140KB floppy disk.
+  - Aligned `STREAM_BLK0 = 100` on both `jukebox.po` and `jukebox.hdv`, ensuring Track 2 (Chopin) plays from the opening note (00:00.0).
+- **Documentation**:
+  - `README.md`: Documented status bar display format, symbol definitions (`#^-=.`), and PCM block counter.
+
 ---
 
 ## 3. Comparative Research: ZSMKit vs VERA PSG (Why MIDI Sounds Different)

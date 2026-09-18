@@ -826,19 +826,8 @@ SHOW_STATUS:
 
     ; Minutes
     LDA DISP_MIN
-    LDX #$B0
-DIV10_MIN:
-    CMP #10
-    BCC DIV10_MIN_DONE
-    SEC
-    SBC #10
-    INX
-    BNE DIV10_MIN
-DIV10_MIN_DONE:
-    PHA
-    TXA
-    STA $07D3
-    PLA
+    JSR DIV10_V
+    STX $07D3
     ORA #$B0
     STA $07D4
 
@@ -847,19 +836,8 @@ DIV10_MIN_DONE:
 
     ; Seconds
     LDA DISP_SEC
-    LDX #$B0
-DIV10_SEC:
-    CMP #10
-    BCC DIV10_SEC_DONE
-    SEC
-    SBC #10
-    INX
-    BNE DIV10_SEC
-DIV10_SEC_DONE:
-    PHA
-    TXA
-    STA $07D6
-    PLA
+    JSR DIV10_V
+    STX $07D6
     ORA #$B0
     STA $07D7
 
@@ -880,42 +858,89 @@ DIV6_FRM_DONE:
     TXA
     STA $07D9
 
-    ; Master volume
-    LDA #$A0
+    ; 16-channel activity meter: ' [' + 16 chars + ']' at $07DA..$07EC
+    ; Each char maps SHADOW[voice*4+2] vol bits (0..63):
+    ;   0     -> '.' ($AE)   silent
+    ;   1..14 -> '-' ($AD)   quiet
+    ;  15..34 -> '=' ($BD)   medium
+    ;  35..49 -> '#' ($A3)   loud
+    ;  50..63 -> '^' ($DE)   peak
+    LDA #$A0              ; ' ' (space between tenths and '[')
     STA $07DA
-    LDA #$D6              ; 'V'
+    LDA #$DB              ; '['
     STA $07DB
+    LDY #$02              ; Y = SHADOW offset: ctrl byte of voice 0 (voices: 0,4,8...60)
+    LDX #$00              ; X = screen column 0..15
+METER_LOOP_V:
+    LDA SHADOW,Y
+    AND #$3F              ; extract volume bits 5:0
+    BEQ METER_DOT_V
+    CMP #15
+    BCC METER_DASH_V
+    CMP #35
+    BCC METER_EQ_V
+    CMP #50
+    BCC METER_HASH_V
+    LDA #$DE              ; '^'
+    !byte $2C             ; BIT abs (skip next 2 bytes)
+METER_HASH_V:
+    LDA #$A3              ; '#'
+    !byte $2C
+METER_EQ_V:
+    LDA #$BD              ; '='
+    !byte $2C
+METER_DASH_V:
+    LDA #$AD              ; '-'
+    !byte $2C
+METER_DOT_V:
+    LDA #$AE              ; '.'
+METER_PUT_V:
+    STA $07DC,X
+    INX
+    TYA
+    CLC
+    ADC #$04              ; next voice ctrl offset
+    TAY
+    CPX #$10              ; 16 voices done?
+    BNE METER_LOOP_V
+    LDA #$DD              ; ']'
+    STA $07EC
+
+    ; Volume: " V:xx" at $07ED..$07F1
+    LDA #$A0              ; ' '
+    STA $07ED
+    LDA #$D6              ; 'V'
+    STA $07EE
     LDA #$BA              ; ':'
-    STA $07DC
-    LDA #$A0
-    STA $07DD
+    STA $07EF
 
     LDA MASTER_VOL
-    LDX #$B0
-DIV10_VOL:
-    CMP #10
-    BCC DIV10_VOL_DONE
-    SEC
-    SBC #10
-    INX
-    BNE DIV10_VOL
-DIV10_VOL_DONE:
-    PHA
-    TXA
-    STA $07DE
-    PLA
+    JSR DIV10_V
+    STX $07F0
     ORA #$B0
-    STA $07DF
+    STA $07F1
 
-    ; Pause indicator
+    ; Pause indicator: " P" at $07F2..$07F3
     LDA #$A0
-    STA $07E0
-    STA $07E1
+    STA $07F2
+    STA $07F3
     LDA MUTE
     BEQ STATUS_UNMUTED
     LDA #$D0              ; 'P'
-    STA $07E1
+    STA $07F3
 STATUS_UNMUTED:
+    RTS
+
+DIV10_V:
+    LDX #$B0
+DIV10_VL:
+    CMP #10
+    BCC DIV10_VD
+    SEC
+    SBC #10
+    INX
+    BNE DIV10_VL
+DIV10_VD:
     RTS
 
 ; ==============================================================================

@@ -694,20 +694,8 @@ SHOW_STATUS:
 
     ; Format minutes (0..99) -> $07D3, $07D4
     LDA DISP_MIN
-    LDX #$00
-DIV10_MIN_P:
-    CMP #10
-    BCC DIV10_MIN_DONE_P
-    SEC
-    SBC #10
-    INX
-    BNE DIV10_MIN_P
-DIV10_MIN_DONE_P:
-    PHA
-    TXA
-    ORA #$B0
-    STA $07D3
-    PLA
+    JSR DIV10_P
+    STX $07D3
     ORA #$B0
     STA $07D4
 
@@ -716,20 +704,8 @@ DIV10_MIN_DONE_P:
 
     ; Format seconds (0..59) -> $07D6, $07D7
     LDA DISP_SEC
-    LDX #$00
-DIV10_SEC_P:
-    CMP #10
-    BCC DIV10_SEC_DONE_P
-    SEC
-    SBC #10
-    INX
-    BNE DIV10_SEC_P
-DIV10_SEC_DONE_P:
-    PHA
-    TXA
-    ORA #$B0
-    STA $07D6
-    PLA
+    JSR DIV10_P
+    STX $07D6
     ORA #$B0
     STA $07D7
 
@@ -751,43 +727,93 @@ DIV6_FRM_DONE_P:
     ORA #$B0
     STA $07D9
 
-    LDA #$A0              ; ' '
+    ; 16-channel activity meter: ' [' + 16 chars + ']' at $07DA..$07EC
+    ; Each char maps SHADOW[voice*4+2] vol bits (0..63):
+    ;   0     -> '.' ($AE)   silent
+    ;   1..14 -> '-' ($AD)   quiet
+    ;  15..34 -> '=' ($BD)   medium
+    ;  35..49 -> '#' ($A3)   loud
+    ;  50..63 -> '^' ($DE)   peak
+    LDA #$A0              ; ' ' (space between tenths and '[')
     STA $07DA
-    LDA #$D6              ; 'V'
+    LDA #$DB              ; '['
     STA $07DB
+    LDY #$02              ; Y = SHADOW offset: ctrl byte of voice 0 (voices: 0,4,8...60)
+    LDX #$00              ; X = screen column 0..15
+METER_LOOP_P:
+    LDA SHADOW,Y
+    AND #$3F              ; extract volume bits 5:0
+    BEQ METER_DOT_P
+    CMP #15
+    BCC METER_DASH_P
+    CMP #35
+    BCC METER_EQ_P
+    CMP #50
+    BCC METER_HASH_P
+    LDA #$DE              ; '^'
+    !byte $2C             ; BIT abs (skip next 2 bytes)
+METER_HASH_P:
+    LDA #$A3              ; '#'
+    !byte $2C
+METER_EQ_P:
+    LDA #$BD              ; '='
+    !byte $2C
+METER_DASH_P:
+    LDA #$AD              ; '-'
+    !byte $2C
+METER_DOT_P:
+    LDA #$AE              ; '.'
+METER_PUT_P:
+    STA $07DC,X
+    INX
+    TYA
+    CLC
+    ADC #$04              ; next voice ctrl offset
+    TAY
+    CPX #$10              ; 16 voices done?
+    BNE METER_LOOP_P
+    LDA #$DD              ; ']'
+    STA $07EC
+
+    ; Volume: " V:xx" at $07ED..$07F1
+    LDA #$A0              ; ' '
+    STA $07ED
+    LDA #$D6              ; 'V'
+    STA $07EE
     LDA #$BA              ; ':'
-    STA $07DC
+    STA $07EF
 
     LDA MASTER_VOL
-    LDX #$B0
-DIV10_VOL_P:
-    CMP #10
-    BCC DIV10_VOL_DONE_P
-    SEC
-    SBC #10
-    INX
-    BNE DIV10_VOL_P
-DIV10_VOL_DONE_P:
-    PHA
-    TXA
-    STA $07DD
-    PLA
+    JSR DIV10_P
+    STX $07F0
     ORA #$B0
-    STA $07DE
+    STA $07F1
 
-    ; Pause indicator: " P" at $07DF..$07E0
+    ; Pause indicator: " P" at $07F2..$07F3
     LDA #$A0
-    STA $07DF
-    STA $07E0
+    STA $07F2
+    STA $07F3
     LDA MUTE
     BEQ STATUS_UNMUTED
     LDA #$D0              ; 'P'
-    STA $07E0
+    STA $07F3
 STATUS_UNMUTED:
     RTS
 
+DIV10_P:
+    LDX #$B0
+DIV10_PL:
+    CMP #10
+    BCC DIV10_PD
+    SEC
+    SBC #10
+    INX
+    BNE DIV10_PL
+DIV10_PD:
+    RTS
+
 TITLE:
-    ASC "VERA PSG PLAYER 60HZ R5          "
+    ASC "VERA PSG PLAYER 60HZ R6          "
     !byte 0
 TITLE2:
     ASC "ESC=EXIT P=PAUSE +,-=VOL [,]=SEEK"

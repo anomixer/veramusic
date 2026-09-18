@@ -1,7 +1,8 @@
 # VERA Music (veramusic)
 
-**High-Fidelity Audio Engine & Jukebox Suite for Apple II with VERA Card**
+**High-Fidelity Audio Engine & Jukebox Suite (Release R6) for Apple II with VERA Card**
 
+[![Release](https://img.shields.io/badge/release-R6-blueviolet.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20II%20%7C%20IIe%20%7C%20IIgs-orange.svg)]()
 [![Hardware](https://img.shields.io/badge/hardware-VERA%20Card%20(Slot%202%20%2F%204)-brightgreen.svg)]()
@@ -37,7 +38,7 @@ Tested on:
   - `M`: Shadowed register mute.
   - `+` / `-`: 16-level master volume scaling.
   - `]` / `[`: Universal 5-second fast-forward and rewind.
-  - Live stopwatch display: `T: mm:ss.s  V: xx`.
+  - Live on-screen display: 16-voice activity meter (`T: mm:ss.c [...] V:xx`) for PSG tracks; direct disk block counter (`T: mm:ss.c B:xxxx V:xx`) for PCM stream tracks.
 
 ---
 
@@ -47,10 +48,11 @@ Tested on:
 | Track | Title | Format | Duration | Technology |
 |---|---|---|---|---|
 | **1** | **Melody Demo** | RAM PSG | 0:30 | 6502 RAM-resident 60 Hz PSG event player |
-| **2** | **Chopin: Fantaisie-Impromptu** | VERA RAM PSG | 5:02 | 16-voice authentic PSG lead + thunderous saw bass |
-| **3** | **Michael Jackson: Beat It** | Stream PSG | 3:58 | 16-voice rock chiptune engine + GM drums + vocal blues scoop bend |
-| **4** | **Captain: Space Debris** | Stream PCM | 5:05 | 8010 Hz direct-to-FIFO ProDOS disk streaming |
-| **5** | **Alexander Nakarada: The Wellerman** | Stream PCM | 2:00 | 8010 Hz full acoustic folk ballad with TPDF dither |
+| **2** | **Fantaisie Impromptu** | VERA RAM PSG | 5:02 | 16-voice authentic PSG lead + thunderous saw bass |
+| **3** | **Beat It** | Stream PSG | 3:58 | 16-voice rock chiptune engine + GM drums + vocal blues scoop bend |
+| **4** | **Caribbean Blue** | Stream PSG | 2:56 | Enya MIDI → 16-voice PSG with high choir nana vocals |
+| **5** | **Space Debris** | Stream PCM | 5:05 | 8010 Hz direct-to-FIFO ProDOS disk streaming |
+| **6** | **The Wellerman** | Stream PCM | 2:00 | 8010 Hz full acoustic folk ballad with TPDF dither |
 
 ### 2. Bootable 140KB Floppy (`jukebox.po`)
 | Track | Title | Format | Duration | Technology |
@@ -149,6 +151,45 @@ psgplay.exe ..\music\HIGHSCORE.psg --vol 12
 - `R`: Restart from beginning
 - `L`: Toggle looping on / off
 - `ESC` or `Q`: Quit player
+
+### Real-Time Status Bar (Apple II & Windows)
+
+The status display on Apple II text screen (Row 23) and native Windows `psgplay.exe` automatically adapts based on the audio engine:
+
+#### 1. PSG Tracks (Tracks 1–4: Demo, Chopin, Beat It, Caribbean Blue)
+Features a real-time 16-channel hardware voice meter:
+
+```text
+T: mm:ss.c [##=#==^===......] V:15
+```
+
+- **`T: mm:ss.c`**: Elapsed playback stopwatch (minutes, seconds, and tenths of a second `c`).
+- **`[...]`**: 16-character real-time activity meter corresponding to VERA PSG **voices 0 through 15** (left to right).
+- **`V:xx`**: Master volume level (0 to 15).
+- **`P`**: Displayed when playback is paused.
+
+##### Voice Activity Symbol Guide
+Each character reflects the instantaneous volume register (bits 5:0, 0..63) of the corresponding PSG hardware voice:
+
+| Symbol | Volume Range (0..63) | Activity Level | Description |
+| :---: | :---: | :---: | :--- |
+| `.` | 0 | **Silent** | Voice inactive or note released |
+| `-` | 1 .. 14 | **Quiet** | Gentle reverb tail, soft ambient pad, or decaying note |
+| `=` | 15 .. 34 | **Medium** | Standard accompaniment, piano chords, rhythm guitar |
+| `#` | 35 .. 49 | **Loud** | Main melody lead, prominent brass, accented notes |
+| `^` | 50 .. 63 | **Peak** | Fortissimo climax, high choir lead, drum transient spike |
+
+#### 2. PCM Stream Tracks (Tracks 5 & 6: Space Debris, The Wellerman)
+Pure 8-bit PCM audio streams directly from ProDOS disk blocks into VERA's 4 KB hardware FIFO without using PSG voices. Instead of channel meters, it displays the real-time physical disk block address:
+
+```text
+T: mm:ss.c B:xxxx V:15
+```
+
+- **`T: mm:ss.c`**: Elapsed playback stopwatch (minutes, seconds, and tenths of a second `c`).
+- **`B:xxxx`**: Current 4-digit hexadecimal ProDOS disk block number being streamed from storage (e.g. `B:1388` for block 5000 in *Space Debris*, `B:0258` for block 600 in *The Wellerman*).
+- **`V:xx`**: Master volume level (0 to 15).
+- **`P`**: Displayed when playback is paused.
 
 
 ---

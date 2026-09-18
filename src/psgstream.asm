@@ -12,7 +12,7 @@
 ; MLI clobbers A/X/Y/P (Time Pilot lesson) -> REFILL preserves all four.
 ;
 ; Controls: ESC/Q = exit, M = mute (64-byte shadow restore).
-; Status: title row 0, "F:xxxxxx B:xxxx M_" row 23 ($07D0), "DISK ERR" row 22.
+; Status: title row 0, "T: mm:ss.x [16-ch meter] V:xx" row 23 ($07D0), "DISK ERR" row 22.
 ; Conventions: asm6502.mjs syntax, VERA_BASE injected, $2000 BRUN, dual slot.
 ; Zero page $06-$08, $19-$1B. Buffer $4000-$41FF. Code must stay below $3800.
 ; ==============================================================================
@@ -876,26 +876,61 @@ DIV6_FRM_DONE:
     ORA #$B0
     STA $07D9
 
-    LDA #$A0              ; ' '
+    ; 16-channel activity meter: ' [' + 16 chars + ']' at $07DA..$07EC
+    ; Each char maps SHADOW[voice*4+2] vol bits (0..63):
+    ;   0     -> '.' ($AE)   silent
+    ;   1..14 -> '-' ($AD)   quiet
+    ;  15..34 -> '=' ($BD)   medium
+    ;  35..49 -> '#' ($A3)   loud
+    ;  50..63 -> '^' ($DE)   peak
+    LDA #$A0              ; ' ' (space between tenths and '[')
     STA $07DA
-    LDA #$C2              ; 'B'
+    LDA #$DB              ; '['
     STA $07DB
-    LDA #$BA              ; ':'
-    STA $07DC
+    LDY #$02              ; Y = SHADOW offset: ctrl byte of voice 0 (voices: 0,4,8...60)
+    LDX #$00              ; X = screen column 0..15
+METER_LOOP:
+    LDA SHADOW,Y
+    AND #$3F              ; extract volume bits 5:0
+    BEQ METER_DOT
+    CMP #15
+    BCC METER_DASH
+    CMP #35
+    BCC METER_EQ
+    CMP #50
+    BCC METER_HASH
+    LDA #$DE              ; '^'
+    !byte $2C             ; BIT abs (skip next 2 bytes)
+METER_HASH:
+    LDA #$A3              ; '#'
+    !byte $2C
+METER_EQ:
+    LDA #$BD              ; '='
+    !byte $2C
+METER_DASH:
+    LDA #$AD              ; '-'
+    !byte $2C
+METER_DOT:
+    LDA #$AE              ; '.'
+METER_PUT:
+    STA $07DC,X
+    INX
+    TYA
+    CLC
+    ADC #$04              ; next voice ctrl offset
+    TAY
+    CPX #$10              ; 16 voices done?
+    BNE METER_LOOP
+    LDA #$DD              ; ']'
+    STA $07EC
 
-    LDX #$00              ; block counter: DISPB_H at $07DD-$07DE, DISPB_L at $07DF-$07E0
-    LDA DISPB_H
-    JSR HEXBYTE_AT_DD
-    LDA DISPB_L
-    JSR HEXBYTE_AT_DD
-
-    ; Volume: " V:xx" at $07E1..$07E5
+    ; Volume: " V:xx" at $07ED..$07F1
     LDA #$A0              ; ' '
-    STA $07E1
+    STA $07ED
     LDA #$D6              ; 'V'
-    STA $07E2
+    STA $07EE
     LDA #$BA              ; ':'
-    STA $07E3
+    STA $07EF
 
     LDA MASTER_VOL
     LDX #$B0              ; '0'
@@ -909,50 +944,28 @@ DIV10_VOL:
 DIV10_VOL_DONE:
     PHA
     TXA
-    STA $07E4             ; tens ('0' or '1')
+    STA $07F0             ; tens
     PLA
     ORA #$B0
-    STA $07E5             ; units ('0'..'9')
+    STA $07F1             ; units
 
-    ; Pause indicator: " P" at $07E6..$07E7
+    ; Pause indicator: " P" at $07F2..$07F3, blank padding $07F4..$07F7
     LDA #$A0
-    STA $07E6
-    STA $07E7
+    STA $07F2
+    STA $07F3
+    STA $07F4
+    STA $07F5
+    STA $07F6
+    STA $07F7
     LDA MUTE
     BEQ STATUS_UNMUTED
     LDA #$D0              ; 'P'
-    STA $07E7
+    STA $07F3
 STATUS_UNMUTED:
     RTS
 
-; A = byte -> 2 hex chars at $07DD+X (block) ; X += 2 (X enters 0)
-HEXBYTE_AT_DD:
-    PHA
-    LSR A
-    LSR A
-    LSR A
-    LSR A
-    JSR NIB_DD
-    PLA
-    AND #$0F
-    JSR NIB_DD
-    RTS
-NIB_DD:
-    CMP #$0A
-    BCC NIBD_DD
-    ADC #$36              ; C=1 from CMP. NO CLC here.
-    ORA #$80
-    STA $07DD,X
-    INX
-    RTS
-NIBD_DD:
-    ORA #$B0
-    STA $07DD,X
-    INX
-    RTS
-
 TITLE:
-    ASC "VERA PSG STREAM 60HZ R5                 "
+    ASC "VERA PSG STREAM 60HZ R6                 "
     !byte 0
 TITLE2:
     ASC "ESC=EXIT P=PAUSE +,-=VOL [,]=SEEK       "
