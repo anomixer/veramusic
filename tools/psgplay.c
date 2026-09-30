@@ -272,9 +272,9 @@ static void render_frame(int16_t *outBuffer) {
     mixL *= effVol;
     mixR *= effVol;
 
-    // Soft analog-style tanh saturation to avoid harsh clipping
-    float satL = tanhf(mixL / 3.0f);
-    float satR = tanhf(mixR / 3.0f);
+    // Soft analog-style tanh saturation with ample 8-voice headroom to avoid harsh clipping
+    float satL = tanhf(mixL / 8.0f);
+    float satR = tanhf(mixR / 8.0f);
 
     int32_t valL = (int32_t)(satL * 30000.0f);
     int32_t valR = (int32_t)(satR * 30000.0f);

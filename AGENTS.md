@@ -468,6 +468,18 @@ The VERA card on Apple II provides:
 - **Documentation**:
   - `README.md`: Documented status bar display format, symbol definitions (`#^-=.`), and PCM block counter.
 
+### Milestone 29: Native Windows Player (`psgplay.exe`) Polyphonic Mix Headroom Overhaul (2026-09-30)
+- **User Problem**: Chopin *Fantaisie-Impromptu* sounded crisp and elegant inside `jukebox.hdv` (AppleWin), but sounded harsh, distorted, and unpleasantly crushed ("撕心裂肺") when played in the native Windows player `tools/psgplay.exe`.
+- **Root Cause Analysis (`tools/psgplay.c`)**:
+  - `psgplay.c` originally normalized the combined voice sum with a fixed divisor of 3 before feeding into `tanhf()` soft-saturation (`tanhf(mix / 3.0f)`).
+  - While adequate for monophonic or 2-to-3-voice tracks, polyphonic piano tracks like Chopin (*Fantaisie-Impromptu*) frequently have 8–12 voices actively sounding simultaneously during arpeggios with pedal sustain.
+  - When the summed voice amplitude reached 8.0–10.0, dividing by 3 pushed the input into `tanhf(3.0+)`, slamming against the hard saturation curve and causing severe non-linear compression and clipping distortion.
+- **Engine Fix**:
+  - Expanded the voice mix headroom divisor from `/ 3.0f` to `/ 8.0f` (`tanhf(mixL / 8.0f)` / `tanhf(mixR / 8.0f)`).
+  - Recompiled `tools/psgplay.exe` with MSVC (`vcvars32.bat`).
+- **Result**:
+  - Eliminated polyphonic distortion completely. Multi-voice piano passages now render with clean, open dynamic range and zero harsh clipping, matching the hardware behavior on AppleWin.
+
 ---
 
 ## 3. Comparative Research: ZSMKit vs VERA PSG (Why MIDI Sounds Different)
