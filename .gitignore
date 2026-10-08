@@ -24,6 +24,20 @@ music/*.m4a
 *.dis
 _sim_stream*.json
 
+# Emulator debug dumps (VERA VRAM / save states)
+vera_dump.bin
+state.aws
+
+# AppleWin FM test program (separate project)
+fmtest.po
+fmtest_auto.po
+src/FMTEST.BIN
+src/FMTEST4.BIN
+src/fmtest.asm
+src/fmtest_startup.bas
+tools/build_fmtest.mjs
+tools/build_fmtest_po.mjs
+
 # OS & Editor artifacts
 .DS_Store
 Thumbs.db

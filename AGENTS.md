@@ -21,9 +21,10 @@ The VERA card on Apple II provides:
   - 4 KB hardware FIFO buffer.
   - Rate register (`VERA_AUDIO_RATE`, `$1E`): rate = 1..128, actual Hz = `(rate / 128) * 48828.125 Hz`. Rate `21` (`$15`) = **8010.864 Hz**.
   - Ctrl register (`VERA_AUDIO_CTRL`, `$1C`): bit 7 = FIFO reset, bit 5 = stereo/mono (0=mono), bits 3:0 = volume (0..15).
-- **NO YM2151 FM Synthesizer**:
-  - The Commander X16 has a Yamaha YM2151 (OPM) chip on board.
-  - The **Apple II VERA card has NO YM2151**. All sound must be synthesized via VERA PSG or streamed via VERA PCM.
+- **YM2151 FM Synthesizer (emulated in AppleWin fork only)**:
+  - The Commander X16 has a Yamaha YM2151 (OPM) chip on board; the **physical Apple II VERA card has NO YM2151**.
+  - The **AppleWin VERA fork** (`anomixer/AppleWin`) emulates the YM2151 with the **ymfm** synthesis core (`source\ymfm\`, registers at slot base + `$20`/`$21`, e.g. `$C220`/`$C221` on Slot 2), so ZSM music with FM plays back in the emulator.
+  - `tools/zsmplay.exe` renders the same YM2151 + VERA PSG mix natively on Windows for auditioning `.zsm` files (see Milestone 30).
 
 ### 1.2 Host CPU & Memory Constraints
 - Apple II 6502 @ 1.02 MHz: single frame budget at 60 Hz = ~17,030 clock cycles.
@@ -480,6 +481,30 @@ The VERA card on Apple II provides:
 - **Result**:
   - Eliminated polyphonic distortion completely. Multi-voice piano passages now render with clean, open dynamic range and zero harsh clipping, matching the hardware behavior on AppleWin.
 
+### Milestone 30: Native Windows ZSM Player (`zsmplay.exe`) — VERA PSG + YM2151 FM + VERA PCM (2026-10-08)
+- **User Problem**: `zsm2psg.mjs` transcodes Commander X16 ZSM music into VERA-PSG-only `.psg` streams, discarding the YM2151 FM parts. There was no way to audition the original `.zsm` files (FM percussion, drums, stereo panning) on Windows without a Commander X16.
+- **Implementation (`tools/zsmplay.cpp`)**:
+  - **ZSM container decoder**: 16-byte header (`zm`/`ZSM` magic, 24-bit loop offset, 24-bit PCM table offset, FM channel mask, PSG voice mask, 16-bit tick rate) followed by a 60 Hz command stream — native PSG writes (`< $40`: `[reg, val]`), EXTCMD (`$40`: `[ext, data[ext & $3F]]`), YM2151 batches (`$41`–`$7F`: `count = cmd & $3F` register pairs), end-of-data (`$80`), tick delays (`> $80`: `tick += cmd & $7F`).
+  - **PCM table**: `"PCM"` magic + `inst_max` + `(inst_max+1)` 16-byte instrument entries (geometry bits 5:4 = format, 24-bit data offset/length/loop point relative to the data area) followed by raw sample data. EXTCMD `ext < $40` carries PCM sub-events: `[0x00, ctrl]` volume (bits 3:0) + FIFO flush (bit 7), `[0x01, rate]`, `[>=0x02, instrument]` trigger.
+  - **Dual synthesis engines**:
+    - VERA PSG: 16-voice synthesis ported from `psgplay.c` (pulse/sawtooth/triangle/noise, 64-step logarithmic volume LUT, 48 kHz output).
+    - YM2151: **ymfm** core (`ymfm::ym2151`, compiled in from `AppleWin\source\ymfm\ymfm_opm.cpp`); native ~55,930 Hz output linearly resampled to 48 kHz.
+  - **VERA PCM playback**: sample rate = `rate × 48828.125 / 128` Hz (format from instrument geometry: 0=mono8 / 1=stereo8 / 2=mono16 / 3=stereo16), linear interpolation, VERA PCM volume LUT (`{0,1,2,3,4,5,6,8,11,14,18,23,30,38,49,64}`, output = `sample × LUT[v] / 64`), loop-point restart, matching the AppleWin VERA card implementation (`VERAAudio.cpp`).
+  - **True stereo**: YM2151 per-channel pan (reg `$20`–`$27`: bit 6 = left, bit 7 = right → `output.data[0]` / `data[1]`) and VERA PSG per-voice stereo control bits, summed and mixed with `tanh` soft saturation.
+  - **FM mix gain**: default 12.0× — the raw ymfm output (±1.0) is buried under the 16-voice PSG sum, which made FM drums inaudible; adjustable via `--fmvol 0.25..16` or `F1`/`F2` hotkeys, shown live as `FM:x.xx` in the status bar.
+  - **Loop semantics**: matches `zsmkit.s` — at end-of-data the stream cursor repoints to the loop frame **without** resetting PSG/YM state (the loop-point state carries over). A track with no loop point plays once and exits (after the audio buffers drain).
+  - **Tick-rate normalization**: non-60 Hz tick rates (header offset 12–13) are normalized to the 60 Hz output clock via a fractional accumulator.
+  - **Header masks**: FM channel mask (offset 9) and PSG voice mask (offset 10–11) are applied during event dispatch.
+  - **FM VU meter**: the 16-slot activity meter shows YM2151 channels 0-7 (key-on state tracked from reg `$08` writes: channel = `val & 7`, operator mask = bits 3-6) in slots 0-7 and PSG voices 0-7 in slots 8-15 when `fmMask` ≠ 0; pure-PSG tracks show all 16 PSG voices.
+  - **PCM VU meter + gain**: slots 16-17 show the VERA PCM L/R output peak (0..32767, tracked before gain so the meter reflects sample content; `.` `-` `=` `#` `^` at 0/8192/16384/24576). PCM mix gain (`pcmGain`, default 12.0×, `--pcmvol`/`F5`/`F6`, 0.25..16) is applied after the volume LUT and shown live as `PCM:x.xx` in the status bar.
+  - **PSG gain**: `psgGain` (default 12.0×, `--psgvol`/`F3`/`F4`, 0.25..16) scales the summed 16-voice PSG output before mixing; shown live as `PSG:x.xx`. Hotkey layout: F1/F2 = FM, F3/F4 = PSG, F5/F6 = PCM.
+- **Diagnostic tools**:
+  - `tools/zsm_scan.mjs`: per-file event histogram (PSG/YM register usage, EXTCMDs, delay ticks) + header field dump + PCM instrument table decode. Revealed TITLE.ZSM's drums are pure FM percussion: reg `$08` key-on (957 writes) + reg `$60`–`$7F` total-level modulation (2,500–3,100 writes per operator), with zero noise-register (`$0F`) writes.
+  - `tools/zsm_pan.mjs`: stereo panning analysis — TITLE.ZSM uses all three YM pan modes (L=208 / R=209 / both=215) plus PSG L/R panning.
+- **Build**: `tools/build_zsmplay.bat` — `cl /O2 /MT /EHsc zsmplay.cpp ymfm_opm.cpp /I<ymfm> /link winmm.lib` (zero external DLL dependencies, same as `psgplay.exe`).
+- **Verified**: TITLE.ZSM decodes to 3,329 frames (55.5 s), loop @ frame 256, real-time playback with correct stereo image and audible FM percussion after the gain fix. TREE.ZSM (PCM-only, 1 instrument, mono 8-bit, 27,847 Hz, 52.8 s, no loop point) plays PCM audio and auto-exits at end of stream.
+- **Gotcha**: `totalFrames` must be `max(frames.size(), tick + 1)` after parsing — delay commands advance the tick counter without emitting events, so a stream ending with delays (e.g. a PCM-only track) would otherwise report a 1-frame song.
+
 ---
 
 ## 3. Comparative Research: ZSMKit vs VERA PSG (Why MIDI Sounds Different)
@@ -541,6 +566,11 @@ To make MIDI piano on VERA PSG sound substantially more authentic ("原汁原味
 | `psgplay.c` | C | Source code for native Windows VERA PSG stream player |
 | `build_psgplay.bat` | Windows CMD | MSVC build script for compiling `psgplay.exe` |
 | `zsm2psg.mjs` | Node.js | Commander X16 ZSM (VERA PSG + YM2151 FM) → 60Hz PSG stream converter |
+| `zsmplay.exe` | Win32 C++ (x86) | Native Windows real-time ZSM player (VERA PSG + YM2151 FM via ymfm, WinMM waveOut 48kHz stereo) |
+| `zsmplay.cpp` | C++ | Source code for native Windows ZSM player |
+| `build_zsmplay.bat` | Windows CMD | MSVC build script for `zsmplay.exe` |
+| `zsm_scan.mjs` | Node.js | ZSM event composition analyzer (PSG/YM register histograms) |
+| `zsm_pan.mjs` | Node.js | ZSM stereo panning usage analyzer |
 | `mid2psg.mjs` | Node.js | Standard MIDI File (.mid) → 60Hz PSG register stream converter |
 | `mod2psg.mjs` | Node.js | ProTracker MOD → 60Hz PSG register stream converter |
 | `wav2pcm.mjs` | Node.js | Audio → VERA 8-bit signed PCM converter (TPDF dither, presets, preview wav) |
@@ -560,6 +590,10 @@ To make MIDI piano on VERA PSG sound substantially more authentic ("原汁原味
 ```cmd
 # Run complete automated build
 build.bat
+
+# Build native Windows players
+tools\build_psgplay.bat
+tools\build_zsmplay.bat
 
 # Manual conversions
 node mod2psg.mjs space_debris.mod --no-wav
