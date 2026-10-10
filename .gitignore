@@ -49,3 +49,8 @@ music/GAMEOVER.psg
 music/HIGHSCORE.psg
 music/KILLED.psg
 music/LEVELCOMPLETE.psg
+
+# zsmplay (Apple //e VERA FM/PSG) build outputs
+zsmplay.hdv
+VERA_FM.log
+*.obj

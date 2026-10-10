@@ -39,6 +39,10 @@ Tested on:
   - Adjustable PSG mix gain (`--psgvol` / `F3` / `F4`, default 12.0×) — VERA PSG voices can be boosted or attenuated.
   - Adjustable PCM mix gain (`--pcmvol` / `F5` / `F6`, default 12.0×) — VERA PCM sample streams can be boosted over the PSG bed.
   - Full ZSM container support: loop points, per-chip channel masks, non-60 Hz tick rates, and the PCM instrument table (mono/stereo, 8/16-bit).
+- **Apple //e ZSM Player (`src/zsmplay.asm` → `zsmplay.po`)**:
+  - A 65C02 program that writes YM2151 FM events through the VERA card's FM daughterboard registers (`VERA_BASE + $20` register select, `VERA_BASE + $21` data/status), the Apple-side equivalent of the X16's `$9F40`/`$9F41`.
+  - Bootable 140KB ProDOS floppy (`zsmplay.po`) with an auto-starting Applesoft `STARTUP` that probes for a slot-2 or slot-4 VERA card before `BRUN`-ing the player.
+  - Dual-slot binaries: `src/ZSMPLAY.BIN` (slot 2) and `src/ZSMPLAY4.BIN` (slot 4), both loaded at `$2000`; exits via `RTS` so control returns cleanly to BASIC.
 - **Universal Player Controls Across All Formats**:
   - `ESC` / `Q`: Clean exit.
   - `P` / `SPACE`: Real-time pause / unpause.
@@ -78,6 +82,14 @@ veramusic/
 ├── jukebox.hdv                # Pre-built bootable 32MB ProDOS hard disk image
 ├── jukebox.hdv.zip            # Compressed 32MB hard disk image (~2.7MB, auto-generated)
 ├── jukebox.po                 # Pre-built bootable 140KB ProDOS floppy disk image
+├── zsmplay.po                 # Pre-built bootable 140KB ProDOS floppy (Apple //e ZSM/FM player)
+├── ymfm/                      # Bundled ymfm YM2151 core (self-contained for tools/zsmplay.exe)
+│   ├── ymfm.h                 # ymfm core base
+│   ├── ymfm_fm.h              # FM engine declarations
+│   ├── ymfm_fm.ipp            # FM engine implementation
+│   ├── ymfm_opm.h             # YM2151 (OPM) declarations
+│   ├── ymfm_opm.cpp           # YM2151 (OPM) implementation
+│   └── LICENSE                # BSD-3-Clause (Aaron Giles)
 ├── AGENTS.md                  # Comprehensive engineering & development log
 ├── src/                       # 6502 assembly players & Applesoft BASIC menus
 │   ├── psgvram.asm            # VERA 128KB SRAM pre-load player (PO & HDV track 2)
@@ -86,6 +98,10 @@ veramusic/
 │   ├── pcmstream.asm          # ProDOS MLI direct block stream player (PCM)
 │   ├── pcmplay.asm            # Host RAM-resident PCM player
 │   ├── hybridstream.asm       # Dual-engine interleaved PSG+PCM player
+│   ├── zsmplay.asm            # Apple //e ZSM player (VERA FM daughterboard, slot 2/4)
+│   ├── ZSMPLAY.BIN            # Built player binary, slot 2 ($2000 BRUN)
+│   ├── ZSMPLAY4.BIN           # Built player binary, slot 4 ($2000 BRUN)
+│   ├── zsmplay_startup.bas    # Applesoft BASIC VERA slot probe → BRUN ZSMPLAY.BIN
 │   ├── vera.inc               # VERA hardware register equates
 │   ├── startup.bas            # Applesoft BASIC auto-boot menu (HDV)
 │   └── startup_po.bas         # Applesoft BASIC auto-boot menu (PO)
@@ -96,6 +112,7 @@ veramusic/
 │   ├── zsmplay.exe            # Native Windows x86 real-time ZSM (VERA PSG + YM2151 FM + VERA PCM) player
 │   ├── zsmplay.cpp            # Source code for zsmplay (ymfm YM2151 + VERA PSG + VERA PCM + WinMM)
 │   ├── build_zsmplay.bat      # MSVC build script for zsmplay.exe
+│   ├── build_zsmplay_po.mjs   # Packs zsmplay.po (ZSMPLAY.BIN + STARTUP) from the ProDOS template
 │   ├── zsm_scan.mjs           # ZSM analyzer (event histogram + header/PCM table dump)
 │   ├── zsm_pan.mjs            # ZSM stereo panning usage analyzer
 │   ├── zsm2psg.mjs            # Commander X16 ZSM → 60 Hz PSG stream converter

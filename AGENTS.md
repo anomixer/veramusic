@@ -505,6 +505,22 @@ The VERA card on Apple II provides:
 - **Verified**: TITLE.ZSM decodes to 3,329 frames (55.5 s), loop @ frame 256, real-time playback with correct stereo image and audible FM percussion after the gain fix. TREE.ZSM (PCM-only, 1 instrument, mono 8-bit, 27,847 Hz, 52.8 s, no loop point) plays PCM audio and auto-exits at end of stream.
 - **Gotcha**: `totalFrames` must be `max(frames.size(), tick + 1)` after parsing — delay commands advance the tick counter without emitting events, so a stream ending with delays (e.g. a PCM-only track) would otherwise report a 1-frame song.
 
+### Milestone 31: Bundled ymfm Source (`ymfm/`) + Apple //e ZSM Player (`zsmplay.asm` → `zsmplay.po`)
+- **User Problem**: `zsmplay.exe` compiled against `C:\dev\applewin\source\ymfm` via an absolute include path, making the veramusic build non-portable. Additionally, `.zsm` music from the x16-hero-vera port (`C:\dev\x16-hero-vera\assets\*.ZSM`) could only be auditioned on Windows — there was no Apple //e-side player that writes the YM2151 FM events through the VERA card's FM daughterboard registers.
+- **Bundled ymfm** (`ymfm/`): `ymfm.h`, `ymfm_fm.h`, `ymfm_opm.h`, `ymfm_fm.ipp`, `ymfm_opm.cpp`, `LICENSE` copied from `AppleWin\source\ymfm`. `tools/build_zsmplay.bat` now uses `set YMFM=%~dp0..\ymfm` (repo-relative) instead of the absolute AppleWin path, so the Windows player builds self-contained.
+- **Apple //e ZSM player** (`src/zsmplay.asm`):
+  - 65C02 program loaded via `BRUN ZSMPLAY.BIN` at `$2000`; writes YM2151 host registers through `YM_REG = VERA_BASE + $20` (register select) and `YM_DATA = VERA_BASE + $21` (data/status) — same convention as the Commander X16 `$9F40`/`$9F41`.
+  - **Code-first layout**: all `.byte` data tables (`INIT_REGS`, `ZSM_STREAM`) live *after* the code. An earlier version placed the stream data before `START`, so BRUN began executing raw data. Data tables use `$FF` terminators.
+  - **Channel 0 init**: `INIT_REGS` programs reg `$20` = `$C7` (RL = L+R, CON = 7 parallel operators), MUL = 1 for all 4 operators (`$40/$48/$50/$58`), TL = `$7F` (`$60–$78`), AR = `$1F` instant attack (`$80–$98`), RR = 7 fast release (`$E0–$F8`).
+  - **ZSM event walk**: `ZSM_STREAM` holds `[reg, val]` pairs; the main loop writes `reg → YM_REG`, `val → YM_DATA`, then a ~1 frame delay. Verified event sequence in the AppleWin `-log` output: `$28/$4A` (KC concert A) → `$08/$78` key-on → `$08/$00` key-off → `$28/$5A` (octave up) → `$08/$78` → `$08/$00`.
+  - **Exit is `RTS`, not `JMP $03D0`**: under ProDOS/BASIC.SYSTEM, jumping to the DOS 3.3 warm-start vector `$03D0` makes BASIC.SYSTEM attempt to reload itself → `** Unable to load BASIC.SYSTEM **`. `RTS` returns cleanly to the BASIC interpreter (BRUN's return vector).
+  - **Delay preserves the stream index**: `DELAY_FRAME` originally did `LDX #$30` for its nested delay loops, clobbering the `X` stream pointer — the event loop then re-wrote the first register pair forever (297 × `$28/$4A`, key-on never reached). Fixed with `TXA/PHA` … `PLA/TAX` around the delay.
+  - **Dual-slot build**: `src/ZSMPLAY.BIN` (slot 2, `VERA_BASE = $C200`) + `src/ZSMPLAY4.BIN` (slot 4, `$C400`).
+- **ProDOS image** (`tools/build_zsmplay_po.mjs` → `zsmplay.po`, 140 KB): built from the `veratest/assets/ProDOS 2.4.3.po` template with the same directory/bitmap allocation logic as `build_fmtest_po.mjs`. Contains `ZSMPLAY.BIN`, `ZSMPLAY4.BIN` (type `$06`, aux `$2000`) and `STARTUP` (type `$FC`).
+- **Startup slot probe** (`src/zsmplay_startup.bas`): the Applesoft STARTUP mirrors `fmtest_startup.bas` — POKEs `$C205`/`$C405` (VERA_CTRL) expecting a read-back, then writes/reads a pattern at DATA0 (`$C203`/`$C403`) to positively identify a slot-2 or slot-4 VERA card before `BRUN ZSMPLAY.BIN` / `BRUN ZSMPLAY4.BIN`.
+- **Verified** (`AppleWin.exe -d1 zsmplay.po -s2 vera -log`): disk boots, slot-2 VERA detected, `ZSMPLAY.BIN` runs, 48 FM register writes (34 init + 12 stream + 2 key-off) with the full key-on/key-off pattern present, then returns to BASIC with no crash.
+- **Gotcha**: `.po` (ProDOS floppy, `-d1`) and `.hdv` (hard-disk image, `-h1`/`-h2`) are different formats — an `.hdv` is not a renamed `.po`, and copying an unrelated `.hdv` (e.g. the x16-hero-vera game image) just ships that image's contents.
+
 ---
 
 ## 3. Comparative Research: ZSMKit vs VERA PSG (Why MIDI Sounds Different)

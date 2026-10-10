@@ -11,7 +11,7 @@ if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\B
 )
 
 cd /d "%~dp0"
-set YMFM=C:\dev\applewin\source\ymfm
+set YMFM=%~dp0..\ymfm
 cl /nologo /O2 /MT /W3 /EHsc zsmplay.cpp "%YMFM%\ymfm_opm.cpp" /I"%YMFM%" /link winmm.lib /out:zsmplay.exe
 set CLERR=%errorlevel%
 if exist zsmplay.obj del zsmplay.obj
