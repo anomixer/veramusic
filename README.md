@@ -1,8 +1,8 @@
 # VERA Music (veramusic)
 
-**High-Fidelity Audio Engine & Jukebox Suite (Release R6) for Apple II with VERA Card**
+**High-Fidelity Audio Engine & Jukebox Suite (Release R7) for Apple II with VERA Card**
 
-[![Release](https://img.shields.io/badge/release-R6-blueviolet.svg)]()
+[![Release](https://img.shields.io/badge/release-R7-blueviolet.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20II%20%7C%20IIe%20%7C%20IIgs-orange.svg)]()
 [![Hardware](https://img.shields.io/badge/hardware-VERA%20Card%20(Slot%202%20%2F%204)-brightgreen.svg)]()
@@ -22,11 +22,11 @@ Tested on:
   - Additive acoustic grand piano synthesis with detuned chorusing, frequency-dependent acoustic decay, and full damper pedal (CC 64) sustain.
   - General MIDI percussion engine synthesized across dedicated triangle/noise channels.
 - **Direct-to-FIFO 8-Bit PCM Streaming (8,010 Hz)**:
-  - Streams full 8-bit signed PCM directly into VERA's 4 KB hardware FIFO using ProDOS raw disk blocks (`READ_BLOCK`).
+  - Reads 8-bit signed PCM sequentially through ProDOS `OPEN` / `READ` / `CLOSE`, then feeds VERA's 4 KB hardware FIFO from a 512-byte buffer. ProDOS follows the file's actual allocation, including tree files.
   - CPU usage under 5% on a 1.02 MHz 6502, buffered against drive seek latency.
   - Studio-grade TPDF (Triangular Probability Density Function) dither to eliminate 8-bit quantization distortion.
 - **VERA 128KB SRAM Pre-Load Player (`psgvram.asm`)**:
-  - Pre-loads entire song streams (e.g. Chopin, 68.6 KB) into VERA's onboard 128 KB SRAM at startup (~2.5s).
+  - Opens the PSG stream from the active ProDOS prefix and pre-loads it into VERA's onboard 128 KB SRAM at startup (~2.5s), without assuming physical block placement.
   - **Zero Floppy Stutter**: 100% silent, stutter-free playback on standard 140KB 5.25" Disk II floppies with no drive head movement during playback.
   - Instantaneous seeking: fast-forward and rewind execute in microseconds.
 - **Native Windows VERA PSG Player (`tools/psgplay.exe`)**:
@@ -50,7 +50,7 @@ Tested on:
   - `+` / `-`: 16-level master volume scaling.
   - `]` / `[`: Universal 5-second fast-forward and rewind.
   - `F1` / `F2`: FM (YM2151) gain down / up (`zsmplay.exe` only).
-  - Live on-screen display: 16-voice activity meter (`T: mm:ss.c [...] V:xx`) for PSG tracks; direct disk block counter (`T: mm:ss.c B:xxxx V:xx`) for PCM stream tracks.
+  - Live on-screen display: 16-voice activity meter (`T: mm:ss.c [...] V:xx`) for PSG tracks; logical 512-byte file-chunk counter (`T: mm:ss.c B:xxxx V:xx`) for PCM stream tracks.
 
 ---
 
@@ -93,11 +93,11 @@ veramusic/
 ├── AGENTS.md                  # Comprehensive engineering & development log
 ├── src/                       # 6502 assembly players & Applesoft BASIC menus
 │   ├── psgvram.asm            # VERA 128KB SRAM pre-load player (PO & HDV track 2)
-│   ├── psgstream.asm          # ProDOS MLI direct block stream player (PSG)
+│   ├── psgstream.asm          # ProDOS MLI OPEN/READ stream player (PSG)
 │   ├── psgplay.asm            # Host RAM-resident PSG player
-│   ├── pcmstream.asm          # ProDOS MLI direct block stream player (PCM)
+│   ├── pcmstream.asm          # ProDOS MLI OPEN/READ stream player (PCM)
 │   ├── pcmplay.asm            # Host RAM-resident PCM player
-│   ├── hybridstream.asm       # Dual-engine interleaved PSG+PCM player
+│   ├── hybridstream.asm       # Legacy hybrid player (not packaged by current builder)
 │   ├── zsmplay.asm            # Apple //e ZSM player (VERA FM daughterboard, slot 2/4)
 │   ├── ZSMPLAY.BIN            # Built player binary, slot 2 ($2000 BRUN)
 │   ├── ZSMPLAY4.BIN           # Built player binary, slot 4 ($2000 BRUN)
@@ -106,6 +106,7 @@ veramusic/
 │   ├── startup.bas            # Applesoft BASIC auto-boot menu (HDV)
 │   └── startup_po.bas         # Applesoft BASIC auto-boot menu (PO)
 ├── tools/                     # Zero-dependency conversion toolchain & Windows player
+│   ├── cadius.exe             # ProDOS-aware disk image packager/validator
 │   ├── psgplay.exe            # Native Windows x86 real-time VERA PSG player
 │   ├── psgplay.c              # Source code for psgplay (WinMM waveOut 48kHz audio)
 │   ├── build_psgplay.bat      # MSVC build script for psgplay.exe
@@ -129,9 +130,24 @@ veramusic/
 
 ## Building & Development
 
+### ProDOS File-Level Portability
+
+All jukebox audio streams are ordinary ProDOS files. `psgstream.asm` and `pcmstream.asm` use `OPEN` / bounded `READ` / `CLOSE`, check MLI status and transfer counts, and handle EOF. PCM seeking uses `SET_MARK`. The floppy Chopin player reads the same file sequentially into a 512-byte buffer and copies it into VERA SRAM before playback. Stream paths use the active ProDOS prefix; when the prefix is empty, the player qualifies the filename with the boot volume name.
+
+Players normalize the Apple IIe to main RAM, PAGE1, and 40-column text on entry. This keeps the direct text-page UI visible when launched from A2Desktop, which uses 80-column display modes.
+
+`hybridstream.asm` is a historical, unused hybrid-format player and is not included in the current jukebox images; its older block-based reader is outside the current file-level playback path.
+
+`tools/build_jukebox.mjs` uses the bundled `tools/cadius.exe` to update catalogs, allocation indexes, file metadata, and volume bitmaps. It copies the bootable ProDOS baselines from the sibling `veratest/assets` directory into a temporary folder, preserves `PRODOS`, `BASIC.SYSTEM`, and `CLOCK.SYSTEM`, adds the application files, then runs Cadius `CHECKVOLUME` and `CATALOG`. Set `CADIUS` to override the bundled executable. The assembler and Applesoft tokenizer are also currently imported from the sibling `veratest/src` checkout.
+
+For a complete copied HDV installation, copy `STARTUP`, all `TESTTUNE*.BIN`, `STREAM*.BIN`, `BEATIT*.BIN`, `CARIBBEAN*.BIN`, `PCMDEB*.BIN`, and `PCMWEL*.BIN` files plus `FANTAISIE.PSG`, `BEATIT.PSG`, `CARIBBEAN.PSG`, `SPACEDEB.PCM`, and `WELLERMAN.PCM` into one ProDOS directory. Set that directory as the active prefix before launching `STARTUP`. The floppy install needs `STARTUP`, `TESTTUNE.BIN`, `TESTTUNE4.BIN`, `STREAM.BIN`, `STREAM4.BIN`, and `FANTAISIE.PSG`. Booting the generated images alone does not replace a copied-directory install check.
+
+`node tools/build_jukebox.mjs` writes `jukebox.po`, `jukebox.hdv`, and the compressed `jukebox.hdv.zip`. PCM tracks 5 and 6 use the SD4 player; smooth 8 kHz playback on Vera SD requires the optimized resident driver built by the sibling `verasdtool` repository.
+
 ### Prerequisites
-- [ACME Cross-Assembler](https://github.com/meonwax/acme) (in `PATH` or `C:\tools\acme\acme.exe`)
 - [Node.js](https://nodejs.org/) (v18 or newer)
+- The sibling `C:\dev\veratest` checkout, which provides the 6502 assembler, Applesoft tokenizer, and clean ProDOS baselines used by `tools/build_jukebox.mjs`.
+- Bundled Cadius at `tools/cadius.exe` (or set `CADIUS` to another Cadius executable).
 
 ### Master Build Command
 ```cmd
@@ -268,14 +284,14 @@ The last two meter slots show the VERA PCM left/right output peak (0..32767, sam
 | `^` | 24576 .. 32767 | Peak / near-full-scale |
 
 #### 2. PCM Stream Tracks (Tracks 5 & 6: Space Debris, The Wellerman)
-Pure 8-bit PCM audio streams directly from ProDOS disk blocks into VERA's 4 KB hardware FIFO without using PSG voices. Instead of channel meters, it displays the real-time physical disk block address:
+Pure 8-bit PCM audio streams from ProDOS files into VERA's 4 KB hardware FIFO without using PSG voices. Instead of channel meters, it displays the logical 512-byte file-chunk count:
 
 ```text
 T: mm:ss.c B:xxxx V:15
 ```
 
 - **`T: mm:ss.c`**: Elapsed playback stopwatch (minutes, seconds, and tenths of a second `c`).
-- **`B:xxxx`**: Current 4-digit hexadecimal ProDOS disk block number being streamed from storage (e.g. `B:1388` for block 5000 in *Space Debris*, `B:0258` for block 600 in *The Wellerman*).
+- **`B:xxxx`**: Current 4-digit hexadecimal logical chunk count from the start of the PCM file. This does not identify a physical disk block; ProDOS resolves the file allocation during each `READ`.
 - **`V:xx`**: Master volume level (0 to 15).
 - **`P`**: Displayed when playback is paused.
 

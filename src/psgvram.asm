@@ -6,8 +6,8 @@
 ; 20-50ms per block, causing audible pauses and stuttering during playback.
 ;
 ; SOLUTION:
-; At startup, this player reads all 138 blocks of Chopin (70,256 bytes) via
-; ProDOS MLI into VERA's 128 KB internal VRAM ($00000..$1126F).
+; At startup, this player opens the PSG stream from the active ProDOS prefix
+; and reads it in sequential 512-byte chunks into VERA's 128 KB internal SRAM.
 ; Once loaded, the floppy drive motor stops completely!
 ;
 ; During playback:
@@ -27,10 +27,11 @@
 MLI         = $BF00
 PRODOS_UNIT = $BF30
 
-STREAM_BLK0 = 100    ; first raw block of .psg stream
-TOTAL_BLKS  = 138    ; 138 blocks = 70,656 bytes (Chopin Fantaisie-Impromptu)
+FILE_BUF = $6000
 
 CNT      = $08
+SRC_L    = $06
+SRC_H    = $07
 SAV_L    = $19
 SAV_M    = $1A
 SAV_H    = $1B
@@ -39,6 +40,16 @@ SAV_CTRL = $1C
 START:
     SEI
     CLD                   ; binary mode
+    ; Normalize A2Desktop's 80-column/page selection for the PAGE1 UI below.
+    LDA #$00
+    STA $C002              ; RAMRD main
+    STA $C004              ; RAMWRT main
+    STA $C000              ; 80STORE off
+    STA $C054              ; PAGE1
+    STA $C00C              ; 80-column off
+    STA $C051              ; TEXT on
+    STA $C052              ; MIXED off
+    STA $C056              ; HIRES off
     LDA #$00
     STA VERA_IEN
     LDA #$01
@@ -46,9 +57,6 @@ START:
     STA KBD_STROBE
 
     JSR SILENCE_ALL
-    LDA PRODOS_UNIT
-    STA PARAM_UNIT        ; bind block reads to boot device
-
     LDA #15
     STA MASTER_VOL
     LDA #$00
@@ -58,6 +66,8 @@ START:
     STA MUTE
     STA ERR
     STA DONE_FLAG
+    STA REF_NUM
+    STA PRELOAD_CHUNKS
     STA CLK_FRM
     STA CLK_SEC
     STA CLK_MIN
@@ -66,6 +76,11 @@ START:
     ; 1. Display Pre-load Screen
     ; --------------------------------------------------------------------------
     JSR SHOW_PRELOAD_SCREEN
+    JSR OPEN_STREAM
+    LDA ERR
+    BEQ PRELOAD_OPEN_OK
+    JMP DISK_FAIL
+PRELOAD_OPEN_OK:
 
     ; --------------------------------------------------------------------------
     ; 2. Pre-load all blocks into VERA VRAM $00000 via Port 0 (Stride +1)
@@ -77,23 +92,28 @@ START:
     LDA #$10              ; Bank 0, Stride +1
     STA VERA_ADDR_H
 
-    LDA #<STREAM_BLK0
-    STA BLK_L
-    LDA #>STREAM_BLK0
-    STA BLK_H
-
-    LDA #<TOTAL_BLKS
-    STA REM_BLKS_L
-    LDA #>TOTAL_BLKS
-    STA REM_BLKS_H
-
 PRELOAD_LOOP:
-    JSR READ_BLOCK_SYNC
+    JSR READ_FILE_CHUNK
     LDA ERR
     BEQ PRELOAD_COPY
     JMP DISK_FAIL
 
 PRELOAD_COPY:
+    LDA READ_PARAMS+6
+    ORA READ_PARAMS+7
+    BEQ PRELOAD_DONE
+    LDA PRELOAD_CHUNKS
+    CMP #248                ; Keep data below VERA's PSG/audio registers.
+    BCC PRELOAD_CAP_OK
+    LDA #$01
+    STA ERR
+    JMP DISK_FAIL
+PRELOAD_CAP_OK:
+    LDA READ_PARAMS+6
+    BNE COPY_SHORT_CHUNK
+    LDA READ_PARAMS+7
+    CMP #$02
+    BNE COPY_SHORT_CHUNK
     LDY #$00
 COPY_PAGE1:
     LDA $4000,Y
@@ -106,22 +126,41 @@ COPY_PAGE2:
     STA VERA_DATA0
     INY
     BNE COPY_PAGE2
+    JMP PRELOAD_COUNT_CHUNK
 
-    INC BLK_L
-    BNE BLK_INC_OK
-    INC BLK_H
-BLK_INC_OK:
+COPY_SHORT_CHUNK:
+    LDA READ_PARAMS+6
+    STA PRELOAD_REMAIN_L
+    LDA READ_PARAMS+7
+    STA PRELOAD_REMAIN_H
+    LDA #<BUF_LO
+    STA SRC_L
+    LDA #>BUF_LO
+    STA SRC_H
+    LDY #$00
+COPY_SHORT_LOOP:
+    LDA (SRC_L),Y
+    STA VERA_DATA0
+    INC SRC_L
+    BNE COPY_SHORT_PTR_OK
+    INC SRC_H
+COPY_SHORT_PTR_OK:
+    LDA PRELOAD_REMAIN_L
+    BNE COPY_SHORT_DEC_LO
+    DEC PRELOAD_REMAIN_H
+COPY_SHORT_DEC_LO:
+    DEC PRELOAD_REMAIN_L
+    LDA PRELOAD_REMAIN_L
+    ORA PRELOAD_REMAIN_H
+    BNE COPY_SHORT_LOOP
 
+PRELOAD_COUNT_CHUNK:
+    INC PRELOAD_CHUNKS
     JSR UPDATE_PROGRESS_BAR
+    JMP PRELOAD_LOOP
 
-    LDA REM_BLKS_L
-    BNE REM_DEC_LO
-    DEC REM_BLKS_H
-REM_DEC_LO:
-    DEC REM_BLKS_L
-    LDA REM_BLKS_L
-    ORA REM_BLKS_H
-    BNE PRELOAD_LOOP
+PRELOAD_DONE:
+    JSR CLOSE_STREAM
 
     ; --------------------------------------------------------------------------
     ; 3. Setup Port 0 for Stream Playback & Port 1 for PSG writes
@@ -225,6 +264,7 @@ DO_MUTE_ON:
 DO_EXIT_JMP:
     JSR IRQ_OFF
     JSR SILENCE_ALL
+    JSR CLOSE_STREAM
     LDA #$00
     STA VERA_CTRL         ; restore Port 0 default
     RTS
@@ -232,6 +272,7 @@ DO_EXIT_JMP:
 DISK_FAIL:
     JSR IRQ_OFF_SAFE
     JSR SILENCE_ALL
+    JSR CLOSE_STREAM
     LDA #$00
     STA VERA_CTRL
     LDX #$00
@@ -705,23 +746,137 @@ SPR_ZERO:
     RTS
 
 ; ==============================================================================
-; PRODOS MLI DISK BLOCK READ (SYNCHRONOUS FOR PRELOAD)
+; ProDOS file calls for allocation-independent preload.
 ; ==============================================================================
-READ_BLOCK_SYNC:
-    LDA BLK_L
-    STA PARAM_BLK_L
-    LDA BLK_H
-    STA PARAM_BLK_H
-    JSR MLI
-    !byte $80
-    !word PARAM_LIST
-    BEQ RB_OK
+OPEN_STREAM:
+    JSR BUILD_FILE_PATH
+    BCC OPEN_PATH_OK
+    LDA #$40
+    STA ERRCODE
     LDA #$01
     STA ERR
     RTS
-RB_OK:
+OPEN_PATH_OK:
+    LDA #$03
+    STA OPEN_PARAMS
+    JSR MLI
+    !byte $C8
+    !word OPEN_PARAMS
+    BCC OPEN_STREAM_OK
+    STA ERRCODE
+    LDA #$01
+    STA ERR
+    RTS
+OPEN_STREAM_OK:
+    LDA OPEN_PARAMS+5
+    STA REF_NUM
+    RTS
+
+; MLI pathnames need a volume-qualified path when ProDOS has no prefix.
+; Preserve a nested active prefix when one exists; otherwise use the boot volume.
+BUILD_FILE_PATH:
+    LDA #$01
+    STA PREFIX_PARAMS
+    JSR MLI
+    !byte $C7
+    !word PREFIX_PARAMS
+    BCS BUILD_PATH_FAIL
+    LDY PATH_BUF
+    BNE BUILD_PATH_PREFIX
+
+    LDA $BF30
+    STA ONLINE_PARAMS+1
+    JSR MLI
+    !byte $C5
+    !word ONLINE_PARAMS
+    BCS BUILD_PATH_FAIL
+    LDA ONLINE_BUF
+    AND #$0F
+    BEQ BUILD_PATH_FAIL
+    STA PATH_LEN
+    LDY #$00
+    LDA #$2F
+    STA PATH_BUF+1,Y
+    INY
+    LDX #$00
+BUILD_PATH_VOLUME:
+    LDA ONLINE_BUF+1,X
+    STA PATH_BUF+1,Y
+    INX
+    INY
+    CPX PATH_LEN
+    BCC BUILD_PATH_VOLUME
+    LDA #$2F
+    STA PATH_BUF+1,Y
+    INY
+    TYA
+    STA PATH_BUF
+    JMP BUILD_PATH_APPEND
+
+BUILD_PATH_PREFIX:
+    LDA PATH_BUF,Y
+    CMP #$2F
+    BEQ BUILD_PATH_APPEND
+    INY
+    LDA #$2F
+    STA PATH_BUF,Y
+    TYA
+    STA PATH_BUF
+BUILD_PATH_APPEND:
+    LDY PATH_BUF
+    LDX #$00
+BUILD_PATH_NAME:
+    LDA FILE_NAME,X
+    BEQ BUILD_PATH_DONE
+    INY
+    CPY #$40
+    BCS BUILD_PATH_FAIL
+    STA PATH_BUF,Y
+    INX
+    BNE BUILD_PATH_NAME
+BUILD_PATH_DONE:
+    TYA
+    STA PATH_BUF
+    CLC
+    RTS
+BUILD_PATH_FAIL:
+    SEC
+    RTS
+
+READ_FILE_CHUNK:
+    LDA REF_NUM
+    STA READ_PARAMS+1
+    JSR MLI
+    !byte $CA
+    !word READ_PARAMS
+    BCC READ_FILE_OK
+    CMP #$4C            ; EOF is expected after the final partial chunk.
+    BEQ READ_FILE_EOF
+    STA ERRCODE
+    LDA #$01
+    STA ERR
+    RTS
+READ_FILE_OK:
     LDA #$00
     STA ERR
+    RTS
+READ_FILE_EOF:
+    LDA #$00
+    STA READ_PARAMS+6
+    STA READ_PARAMS+7
+    STA ERR
+    RTS
+
+CLOSE_STREAM:
+    LDA REF_NUM
+    BEQ CLOSE_STREAM_DONE
+    STA CLOSE_PARAMS+1
+    JSR MLI
+    !byte $CC
+    !word CLOSE_PARAMS
+    LDA #$00
+    STA REF_NUM
+CLOSE_STREAM_DONE:
     RTS
 
 ; ==============================================================================
@@ -757,11 +912,8 @@ PL_BAR:
     RTS
 
 UPDATE_PROGRESS_BAR:
-    ; Draw '=' at $0629 based on block progress: 138 blocks across 38 chars
-    ; Each char ≈ 3.6 blocks
-    LDA BLK_L
-    SEC
-    SBC #<STREAM_BLK0
+    ; Indeterminate progress marker: one cell per four file chunks.
+    LDA PRELOAD_CHUNKS
     LSR A
     LSR A                 ; (blk - 100) / 4 ≈ 0..34
     TAX
@@ -807,6 +959,18 @@ CS_LOOP:
     RTS
 
 SHOW_STATUS:
+    ; The loader and A2Desktop may change IIe display banking. Re-select
+    ; main-memory 40-column page 1 before drawing the live status row.
+    LDA #$00
+    STA $C002              ; RAMRD main
+    STA $C004              ; RAMWRT main
+    STA $C000              ; 80STORE off
+    STA $C054              ; PAGE1
+    STA $C00C              ; 80-column off
+    STA $C051              ; TEXT on
+    STA $C052              ; MIXED off
+    STA $C056              ; HIRES off
+
     SEI
     LDA CLK_FRM
     STA DISP_FRM
@@ -983,10 +1147,9 @@ OLD_H:      !byte 0
 
 TARG_L:     !byte 0
 TARG_H:     !byte 0
-BLK_L:      !byte 0
-BLK_H:      !byte 0
-REM_BLKS_L: !byte 0
-REM_BLKS_H: !byte 0
+PRELOAD_CHUNKS: !byte 0
+PRELOAD_REMAIN_L: !byte 0
+PRELOAD_REMAIN_H: !byte 0
 
 SAV_X:          !byte 0
 SAV_Y:          !byte 0
@@ -994,14 +1157,38 @@ PROD_V:         !byte 0
 PROD_L:         !byte 0
 PROD_H:         !byte 0
 
-; MLI parameter block
-PARAM_LIST:
+PATH_BUF:
+    !byte 0
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+PATH_LEN: !byte $FF
+FILE_NAME_LEN:
+    !byte 13
+FILE_NAME:
+    ASC "MUSICFILE.PSG"
+    !byte 0
+PREFIX_PARAMS:
+    !byte 1
+    !word PATH_BUF
+ONLINE_PARAMS:
+    !byte 2,0
+    !word ONLINE_BUF
+ONLINE_BUF:
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+OPEN_PARAMS:
     !byte 3
-PARAM_UNIT:
+    !word PATH_BUF
+    !word FILE_BUF
     !byte 0
-PARAM_BUF:
+READ_PARAMS:
+    !byte 4
+    !byte 0
     !word $4000
-PARAM_BLK_L:
-    !byte 0
-PARAM_BLK_H:
-    !byte 0
+    !word $0200
+    !word $0000
+CLOSE_PARAMS:
+    !byte 1,0
+REF_NUM: !byte 0
+ERRCODE: !byte 0

@@ -620,3 +620,18 @@ node wav2pcm.mjs alexander-nakarada-the-wellerman.mp3 wellerman_full.pcm --rate=
 # Assemble disk images
 node build_jukebox.mjs
 ```
+
+## File-Level I/O and Cadius Migration (2026-10-11)
+
+- `psgstream.asm` and `pcmstream.asm` now open streams by relative ProDOS pathname and use bounded MLI `READ` calls. PSG reads check actual transfer lengths and reject unterminated/truncated streams; PCM reads use actual end pointers, respect short final reads and EOF, and use `SET_MARK` for logical 512-byte seek offsets. Both close references on exit and error.
+- `psgvram.asm` opens `FANTAISIE.PSG` through the active ProDOS prefix, reads sequentially, copies only transferred bytes into VERA SRAM, and caps the preload before the PSG/audio register region. If ProDOS has an empty prefix, it qualifies the filename with the boot volume name.
+- Runtime reads use application-scoped paths resolved against the active prefix; files with duplicate names elsewhere on the volume are not searched.
+- `tools/build_jukebox.mjs` no longer edits ProDOS directory entries, index blocks, or bitmaps. It copies clean bootable baselines to a temporary directory, uses bundled `tools/cadius.exe` to rename/delete/add files, then runs strict `CHECKVOLUME` and `CATALOG` checks. `CADIUS` remains overridable.
+- Music is packaged as ordinary ProDOS files, including tree-structured PCM files. The README documents the complete copied install set and the active-prefix requirement for nested installs.
+- Verified: both images rebuilt successfully through Cadius; `CHECKVOLUME` reported no allocation errors. Apple II emulator playback and copied nested-directory execution are still separate integration checks.
+
+## Release R7 Packaging (2026-10-11)
+
+- Both `src/startup.bas` and `src/startup_po.bas` display R7.
+- `tools/build_jukebox.mjs` produces `jukebox.po`, `jukebox.hdv`, and `jukebox.hdv.zip`. The former `sd_install/`, `sd_install.po`, and `sd_install.hdv` outputs were removed from the build.
+- PCM tracks 5 and 6 retain the SD4 player. Vera SD playback at the intended pace depends on the optimized resident driver from `verasdtool`.

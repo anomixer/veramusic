@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+/sd_install/
 
 # Generated preview audio files (50MB+ uncompressed files)
 *.wav

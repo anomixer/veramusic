@@ -1,14 +1,10 @@
 ; ==============================================================================
 ; VERA PSG Stream Player for Apple II (mod2psg .psg format, disk streaming)
-; Companion to psgplay.asm (RAM version). The .psg stream lives in CONTIGUOUS
-; raw blocks on disk starting at STREAM_BLK0 (written by build_jukebox.mjs,
-; NOT a ProDOS file). A 512-byte buffer at $4000 is refilled via ProDOS MLI
-; READ_BLOCK ($80) whenever the feeder crosses $41FF — same pattern as the
-; slideshow ZSM engine (MLI from IRQ context is proven on real hardware;
-; main loop performs no disk I/O, so the MLI is single-user).
+; Companion to psgplay.asm (RAM version). Opens the stream as a ProDOS file
+; relative to the active prefix, then refills a 512-byte buffer with MLI READ.
 ;
 ; Stream FORMAT: identical to psgplay.asm (count/reg/val records, $FF +
-; loopFrame u16 terminator). Loop = reset block counter + refill + skip.
+; loopFrame u16 terminator). Loop = reopen file + refill + skip.
 ; MLI clobbers A/X/Y/P (Time Pilot lesson) -> REFILL preserves all four.
 ;
 ; Controls: ESC/Q = exit, M = mute (64-byte shadow restore).
@@ -20,8 +16,6 @@
 * = $2000
 
 MLI         = $BF00
-PRODOS_UNIT = $BF30
-
 STREAM_L = $06       ; feeder pointer into $4000 buffer (zp, for (zp),Y)
 STREAM_H = $07
 CNT      = $08
@@ -32,11 +26,21 @@ SAV_H    = $1B
 BUF_LO  = $4000      ; 512-byte stream buffer (fixed)
 BUF_HI  = $4200      ; = BUF_LO + $200 (exclusive end, full 512-byte ProDOS block)
 
-STREAM_BLK0 = 100    ; first raw block of .psg stream (build_jukebox.mjs agrees)
+FILE_BUF = $6000
 
 START:
     SEI
     CLD                   ; ADC below assumes binary mode
+    ; Normalize A2Desktop's 80-column/page selection for the PAGE1 UI below.
+    LDA #$00
+    STA $C002              ; RAMRD main
+    STA $C004              ; RAMWRT main
+    STA $C000              ; 80STORE off
+    STA $C054              ; PAGE1
+    STA $C00C              ; 80-column off
+    STA $C051              ; TEXT on
+    STA $C052              ; MIXED off
+    STA $C056              ; HIRES off
     LDA #$00
     STA VERA_IEN
     LDA #$01
@@ -44,13 +48,6 @@ START:
     STA KBD_STROBE
 
     JSR SILENCE_ALL
-    LDA PRODOS_UNIT
-    STA PARAM_UNIT      ; bind all block reads to boot device (slideshow idiom)
-
-    LDA #<STREAM_BLK0
-    STA BLK_L
-    LDA #>STREAM_BLK0
-    STA BLK_H
     LDA #15
     STA MASTER_VOL
     LDA #$00
@@ -60,13 +57,20 @@ START:
     STA MUTE
     STA ERR
     STA DONE_FLAG
+    STA REF_NUM
     STA LOOP_L
     STA LOOP_H
-    JSR REFILL_MAIN     ; first block synchronously (IRQ not hooked yet)
+    JSR OPEN_STREAM
+    LDA ERR
+    BNE START_OPEN_FAIL
+    JSR REFILL_MAIN     ; first chunk synchronously (IRQ not hooked yet)
     LDA ERR
     BEQ START_IRQ
     JSR SHOW_TITLE
     JMP DISK_FAIL       ; first block unreadable: report and exit
+START_OPEN_FAIL:
+    JSR SHOW_TITLE
+    JMP DISK_FAIL
 
 START_IRQ:
     JSR SHOW_TITLE
@@ -218,11 +222,7 @@ DO_SEEK_BWD:
     STA TARG_L
     STA TARG_H
 SB_TARG_OK_S:
-    LDA #<STREAM_BLK0
-    STA BLK_L
-    LDA #>STREAM_BLK0
-    STA BLK_H
-    JSR REFILL
+    JSR REWIND_STREAM
     LDA ERR
     BEQ SB_NOERR_S
     CLI
@@ -310,6 +310,7 @@ SB_SEC_OK_S:
 DISK_FAIL:
     JSR IRQ_OFF_SAFE    ; IRQ may never have been hooked: restore only if ours
     JSR SILENCE_ALL
+    JSR CLOSE_STREAM
     LDY #$00
 ERRMSG_LOOP:
     LDA ERRMSG,Y
@@ -353,6 +354,7 @@ NIBD_ERR:
 DO_EXIT:
     JSR IRQ_OFF
     JSR SILENCE_ALL
+    JSR CLOSE_STREAM
     RTS
 
 DO_MUTE:
@@ -520,11 +522,7 @@ DO_LOOP:
     STA LOOP_L
     JSR GETB              ; loopFrame hi
     STA LOOP_H
-    LDA #<STREAM_BLK0
-    STA BLK_L
-    LDA #>STREAM_BLK0
-    STA BLK_H
-    JSR REFILL            ; IRQ context refill (preserves regs)
+    JSR REWIND_STREAM     ; MLI READ uses file allocation, not disk layout
     LDA ERR
     BNE TICK_DONE         ; main loop will report + exit
     LDA LOOP_L
@@ -563,11 +561,7 @@ LOOP_RESET_ONLY:
     RTS
 
 DO_RESTART:
-    LDA #<STREAM_BLK0
-    STA BLK_L
-    LDA #>STREAM_BLK0
-    STA BLK_H
-    JSR REFILL
+    JSR REWIND_STREAM
     LDA #$00
     STA FRM0
     STA FRM1
@@ -583,9 +577,23 @@ DO_RESTART:
 ; --------------------------------------------------------------------------
 GETB:
     LDA STREAM_H
-    CMP #>BUF_HI          ; >= $42 ?
+    CMP BUF_END_H
     BCC GETB_READY
+    BNE GETB_EXHAUSTED
+    LDA STREAM_L
+    CMP BUF_END_L
+    BCC GETB_READY
+GETB_EXHAUSTED:
+    LDA SHORT_READ
+    BNE GETB_TRUNCATED
     JSR REFILL
+    LDA ERR
+    BEQ GETB_READY
+GETB_TRUNCATED:
+    LDA #$01
+    STA ERR
+    LDA #$00
+    RTS
 GETB_READY:
     LDY #$00
     LDA (STREAM_L),Y
@@ -597,8 +605,142 @@ GETB_OK:
     PLA
     RTS
 
-; REFILL: read BLK_L/H -> $4000, BLK++, PTR=$4000. Sets ERR=1 on MLI error.
+; Open, close, and refill a ProDOS stream using pathname-based MLI calls.
 ; Preserves A/X/Y/P (MLI clobbers them; TICK holds reg in X across GETB).
+OPEN_STREAM:
+    JSR BUILD_FILE_PATH
+    BCC OPEN_PATH_OK
+    LDA #$40
+    STA ERRCODE
+    LDA #$01
+    STA ERR
+    RTS
+OPEN_PATH_OK:
+    LDA #$00
+    STA ERR
+    LDA #$03
+    STA OPEN_PARAMS
+    JSR MLI
+    !byte $C8
+    !word OPEN_PARAMS
+    BCC OPEN_STREAM_OK
+    STA ERRCODE
+    LDA #$01
+    STA ERR
+    RTS
+OPEN_STREAM_OK:
+    LDA OPEN_PARAMS+5
+    STA REF_NUM
+    LDA #$00
+    STA SHORT_READ
+    RTS
+
+; Resolve the application file under the active prefix. ProDOS can boot with
+; an empty prefix, so qualify that case with the boot volume name.
+BUILD_FILE_PATH:
+    LDA #$01
+    STA PREFIX_PARAMS
+    JSR MLI
+    !byte $C7
+    !word PREFIX_PARAMS
+    BCC BFP_GOT_PREFIX
+    JMP BFP_FAIL
+BFP_GOT_PREFIX:
+    LDY PATH_BUF
+    BNE BFP_PREFIX
+    LDA $BF30
+    STA ONLINE_PARAMS+1
+    JSR MLI
+    !byte $C5
+    !word ONLINE_PARAMS
+    BCC BFP_ONLINE_OK
+    JMP BFP_FAIL
+BFP_ONLINE_OK:
+    LDA ONLINE_BUF
+    AND #$0F
+    BEQ BFP_FAIL
+    STA PATH_LEN
+    LDY #$00
+    LDA #$2F
+    STA PATH_BUF+1,Y
+    INY
+    LDX #$00
+BFP_VOL_LOOP:
+    LDA ONLINE_BUF+1,X
+    STA PATH_BUF+1,Y
+    INX
+    INY
+    CPX PATH_LEN
+    BCC BFP_VOL_LOOP
+    LDA #$2F
+    STA PATH_BUF+1,Y
+    INY
+    TYA
+    STA PATH_BUF
+    JMP BFP_APPEND
+BFP_PREFIX:
+    LDA PATH_BUF,Y
+    CMP #$2F
+    BEQ BFP_APPEND
+    INY
+    LDA #$2F
+    STA PATH_BUF,Y
+    TYA
+    STA PATH_BUF
+BFP_APPEND:
+    LDY PATH_BUF
+    LDX #$00
+BFP_NAME_LOOP:
+    LDA FILE_NAME,X
+    BEQ BFP_DONE
+    INY
+    CPY #$40
+    BCS BFP_FAIL
+    STA PATH_BUF,Y
+    INX
+    BNE BFP_NAME_LOOP
+BFP_DONE:
+    TYA
+    STA PATH_BUF
+    CLC
+    RTS
+BFP_FAIL:
+    SEC
+    RTS
+
+CLOSE_STREAM:
+    LDA REF_NUM
+    BEQ CLOSE_STREAM_DONE
+    STA CLOSE_PARAMS+1
+    JSR MLI
+    !byte $CC
+    !word CLOSE_PARAMS
+    LDA #$00
+    STA REF_NUM
+CLOSE_STREAM_DONE:
+    RTS
+
+REWIND_STREAM:
+    PHP
+    PHA
+    TXA
+    PHA
+    TYA
+    PHA
+    JSR CLOSE_STREAM
+    JSR OPEN_STREAM
+    LDA ERR
+    BNE REWIND_RESTORE
+    JSR REFILL
+REWIND_RESTORE:
+    PLA
+    TAY
+    PLA
+    TAX
+    PLA
+    PLP
+    RTS
+
 REFILL:
     PHP
     PHA
@@ -606,13 +748,11 @@ REFILL:
     PHA
     TYA
     PHA
-    LDA BLK_L
-    STA PARAM_BLK
-    LDA BLK_H
-    STA PARAM_BLK+1
+    LDA REF_NUM
+    STA READ_PARAMS+1
     JSR MLI
-    !byte $80
-    !word PARAMS
+    !byte $CA
+    !word READ_PARAMS
     BCC REFILL_OK
     STA ERRCODE       ; raw MLI error ($28=no device, $27=I/O, $2B=wprot...)
     LDA #$01
@@ -625,14 +765,40 @@ REFILL:
     PLP
     RTS
 REFILL_OK:
-    INC BLK_L
-    BNE REFILL_NOCARRY
-    INC BLK_H
-REFILL_NOCARRY:
+    LDA READ_PARAMS+6
+    ORA READ_PARAMS+7
+    BNE REFILL_HAS_DATA
+    LDA #$4C             ; ProDOS EOF / empty read
+    STA ERRCODE
+    LDA #$01
+    STA ERR
+    JMP REFILL_RESTORE
+REFILL_HAS_DATA:
+    LDA READ_PARAMS+6
+    CLC
+    ADC #<BUF_LO
+    STA BUF_END_L
+    LDA READ_PARAMS+7
+    ADC #>BUF_LO
+    STA BUF_END_H
+    LDA READ_PARAMS+6
+    BNE REFILL_SHORT
+    LDA READ_PARAMS+7
+    CMP #$02
+    BEQ REFILL_FULL
+REFILL_SHORT:
+    LDA #$01
+    STA SHORT_READ
+    JMP REFILL_PTR
+REFILL_FULL:
+    LDA #$00
+    STA SHORT_READ
+REFILL_PTR:
     LDA #<BUF_LO
     STA STREAM_L
     LDA #>BUF_LO
     STA STREAM_H
+REFILL_RESTORE:
     PLA
     TAY
     PLA
@@ -643,10 +809,6 @@ REFILL_NOCARRY:
 
 ; First-block load from main context (same path, flags ERR identically)
 REFILL_MAIN:
-    LDA #<STREAM_BLK0
-    STA BLK_L
-    LDA #>STREAM_BLK0
-    STA BLK_H
     JSR REFILL
     RTS
 
@@ -796,6 +958,18 @@ TITLE_DONE:
     RTS
 
 SHOW_STATUS:
+    ; ProDOS/SD drivers and A2Desktop may change the IIe display banking
+    ; after file I/O. Re-select main-memory 40-column page 1 before drawing.
+    LDA #$00
+    STA $C002              ; RAMRD main
+    STA $C004              ; RAMWRT main
+    STA $C000              ; 80STORE off
+    STA $C054              ; PAGE1
+    STA $C00C              ; 80-column off
+    STA $C051              ; TEXT on
+    STA $C052              ; MIXED off
+    STA $C056              ; HIRES off
+
     SEI
     LDA CLK_FRM
     STA DISP_FRM
@@ -803,10 +977,6 @@ SHOW_STATUS:
     STA DISP_SEC
     LDA CLK_MIN
     STA DISP_MIN
-    LDA BLK_H
-    STA DISPB_H
-    LDA BLK_L
-    STA DISPB_L
     CLI
 
     ; Write "T: mm:ss.s B:xxxx" at $07D0
@@ -1006,17 +1176,9 @@ DISP1:
     !byte 0
 DISP2:
     !byte 0
-DISPB_L:
-    !byte 0
-DISPB_H:
-    !byte 0
 LOOP_L:
     !byte 0
 LOOP_H:
-    !byte 0
-BLK_L:
-    !byte 0
-BLK_H:
     !byte 0
 MUTE:
     !byte 0
@@ -1050,10 +1212,44 @@ TARG_L:
     !byte 0
 TARG_H:
     !byte 0
-PARAMS:
-    !byte $03
-PARAM_UNIT:
-    !byte $00
-    !word $4000
-PARAM_BLK:
+PATH_BUF:
+    !byte 0
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+PATH_LEN: !byte $FF
+FILE_NAME_LEN:
+    !byte 13
+FILE_NAME:
+    ASC "MUSICFILE.PSG"
+    !byte 0
+PREFIX_PARAMS:
+    !byte 1
+    !word PATH_BUF
+ONLINE_PARAMS:
+    !byte 2,0
+    !word ONLINE_BUF
+ONLINE_BUF:
+    !byte $FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF,$FF
+OPEN_PARAMS:
+    !byte 3
+    !word PATH_BUF
+    !word FILE_BUF
+    !byte 0
+READ_PARAMS:
+    !byte 4
+    !byte 0
+    !word BUF_LO
+    !word $0200
     !word $0000
+CLOSE_PARAMS:
+    !byte 1,0
+REF_NUM:
+    !byte 0
+SHORT_READ:
+    !byte 0
+BUF_END_L:
+    !byte 0
+BUF_END_H:
+    !byte 0
