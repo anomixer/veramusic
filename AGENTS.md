@@ -24,7 +24,7 @@ The VERA card on Apple II provides:
 - **YM2151 FM Synthesizer (emulated in AppleWin fork only)**:
   - The Commander X16 has a Yamaha YM2151 (OPM) chip on board; the **physical Apple II VERA card has NO YM2151**.
   - The **AppleWin VERA fork** (`anomixer/AppleWin`) emulates the YM2151 with the **ymfm** synthesis core (`source\ymfm\`, registers at slot base + `$20`/`$21`, e.g. `$C220`/`$C221` on Slot 2), so ZSM music with FM plays back in the emulator.
-  - `tools/zsmplay.exe` renders the same YM2151 + VERA PSG mix natively on Windows for auditioning `.zsm` files (see Milestone 30).
+  - `tools/melodius.exe` renders the same YM2151 + VERA PSG + VERA PCM mix natively on Windows for auditioning `.zsm` and `.zcm` files (originally `tools/zsmplay.exe`, see Milestones 30 and 34).
 
 ### 1.2 Host CPU & Memory Constraints
 - Apple II 6502 @ 1.02 MHz: single frame budget at 60 Hz = ~17,030 clock cycles.
@@ -521,6 +521,54 @@ The VERA card on Apple II provides:
 - **Verified** (`AppleWin.exe -d1 zsmplay.po -s2 vera -log`): disk boots, slot-2 VERA detected, `ZSMPLAY.BIN` runs, 48 FM register writes (34 init + 12 stream + 2 key-off) with the full key-on/key-off pattern present, then returns to BASIC with no crash.
 - **Gotcha**: `.po` (ProDOS floppy, `-d1`) and `.hdv` (hard-disk image, `-h1`/`-h2`) are different formats — an `.hdv` is not a renamed `.po`, and copying an unrelated `.hdv` (e.g. the x16-hero-vera game image) just ships that image's contents.
 
+### Milestone 33: ZSM Player PSG/FM Mix Balance Fix — Restores the Missing Percussion (2026-10-11)
+- **User Problem**: `zsmplay.exe` playing Commander X16 game music (e.g. `MINE-RESCUE/title.zsm`) lost the percussion track — the CX16 plays `hit-note-note-note` repeatedly, `zsmplay` played `hit-note-note-note` once and then only quiet notes.
+- **Root Cause — the VERA PSG was rendered ~16x too loud, which pinned the output limiter and flattened every FM transient**:
+  - The authoritative VERA core in the AppleWin fork (`C:\dev\applewin\source\VERACard\VERAAudio.cpp`) computes each PSG voice as `val = sign_extend_6bit(wave) * volumeLut[ctrl&0x3f]; l += val >> 3;` — i.e. **one PSG voice at full volume contributes ~1980/32767 (0.060)**, and all 16 voices sum to ~31,700 (just under full scale). This is the same 2,044-per-voice figure already noted in Milestone 11.
+  - `zsmplay.cpp` instead used `volAmp = volumeLut[volIdx] / 511.0f` with a ±1.0 waveform sample, making **one voice = full scale** (16.5x too loud). Two PSG voices therefore reached ±65,000 before any gain was applied.
+  - Milestone 30 then "compensated" by defaulting **all three engine gains to 12x** ("the raw ymfm output is buried under the 16-voice PSG sum"), which made things worse: the sum was driven far past the `tanhf(mix / 8.0f)` knee, so the limiter output sat pinned near full scale for virtually every sample and all dynamics — including the YM2151 drum transients — were crushed away.
+  - The hardware reference mixes the engines 1:1 (`VERACard.cpp`: `mixed = psg + ym`), so there is no reason for any engine gain to differ.
+- **Measured Proof** (offline ymfm render, YM2151 channel 7 removed vs. present, whole 55 s of `TITLE.ZSM`):
+
+  | Mix | Drum RMS vs. mix RMS | Drum share of mix energy | Mix peak / avg |
+  |---|---|---|---|
+  | Before (`LUT/511`, gain 12, `tanh/8`) | **-25.0 dB** | 5.6 % | 29,595 / 9,446 (saturated) |
+  | After (hardware PSG, gain 1, `tanh x2`) | **-11.8 dB** | 25.6 % | 26,149 / 3,414 (clean) |
+
+  Per-second RMS before the fix jumped from ~2,840 to ~14,900 the moment the PSG melody entered (frame 1024, ~17 s) — the limiter was being slammed. After the fix the level stays flat across the whole song.
+- **Changes (`tools/zsmplay.cpp`)**:
+  - PSG voice amplitude now matches the hardware: `volAmp = volumeLut[volIdx] * (4.0f / 32767.0f)`.
+  - `fmGain` / `psgGain` / `pcmGain` defaults changed from `12.0` to `1.0` (hardware-accurate 1:1 sum). `F1`–`F6` and `--fmvol/--psgvol/--pcmvol` still adjust over `0.25..16`.
+  - Output soft clipper changed from `tanhf(mix / 8.0f)` to `tanhf(mix * 2.0f)`, sized for hardware-accurate engine levels (a busy 8-channel FM arrangement peaks near 0.9) instead of the previous over-driven range.
+- **Also verified**: `CANYON.ZSM` (PSG-heavy, 16 voices) previously rendered pinned at the limiter ceiling (29,999/30,000 — i.e. distorted); it now peaks at 25,550 with zero clipped samples.
+- **`tools/psgplay.c` brought onto the same hardware model** (same `VERAAudio.cpp` reference, which is what `zsound` and `zsmkit` ultimately rely on — neither library scales anything, they only write raw VERA PSG / YM2151 registers and let the VERA DAC do the mixing):
+  - Phase accumulator changed to the VERA's 17-bit `0..0x20000` form, advanced by `freq * (PSG_CLOCK / sampleRate)`.
+  - Waveforms now use the hardware's 6-bit unsigned output value, sign-extended to `-32..+31`. This restores the **pulse-width phase offset on the sawtooth and triangle** waveforms, which the old code ignored entirely.
+  - Noise is now **band-limited and per-voice**: each voice latches its own 6-bit sample (`(noiseState >> 1) & 0x3F`) at every half-period of its own oscillator. Previously a single ±1.0 white-noise value was regenerated per sample and shared by all voices, which produced full-bandwidth hiss with correlated voices instead of the hardware's stepped, frequency-limited noise.
+  - Voice level is `(sv * volumeLut[v]) >> 3`, so one voice at full volume is ~1980/32767 and 16 voices sum to just under full scale.
+  - Output clipper moved from `tanhf(mix / 8.0f)` to `tanhf(mix * 2.0f)`. Because the PSG input shrank by exactly 16x, `16 * (1/8) = 2.0` reproduces the previous output level and loudness while leaving the transfer curve in its linear region instead of slamming it — the existing `.psg` previews keep their calibrated volume but lose the distortion.
+
+### Milestone 34: Melodius for Windows — ZSM / ZCM Player (2026-10-11)
+- **Goal**: a native Windows player for Commander X16 music, ported from `C:\dev\melodius` (MooingLemur's X16 music player, which drives **ZSM** and **ZCM** through zsmkit and additionally parses Standard MIDI Files).
+- **Scope delivered**: **ZSM and ZCM only**. Melodius's MIDI engine is **not** ported; `.mid` / `.midi` inputs are rejected with an explicit message rather than silently mis-playing.
+- **`tools/zsmplay.cpp` / `zsmplay.exe` / `build_zsmplay.bat` were deleted** — `melodius.cpp` started life as a copy of `zsmplay.cpp` plus a ZCM loader and file-kind detection, so keeping both meant maintaining the same DSP in two places (the Milestone 33 PSG level fix had to be applied twice). `melodius.exe` is now the single Windows player for X16 music, detecting the format from the file extension. The Apple //e player `src/zsmplay.asm` → `zsmplay.po` is unrelated and remains.
+- **Why the X16 mix comes out right**: on the Commander X16 both formats go through the same engine — YM2151 + VERA PSG + VERA PCM — and the X16 sums them 1:1 in the VERA DAC (`VERACard.cpp`: `mixed = psg + ym`). Neither zsmkit nor ZSound scales anything (they only write raw registers), so reproducing `VERAAudio.cpp` faithfully is what makes the Windows render match the hardware. `melodius.cpp` therefore reuses the Milestone 33 hardware model unchanged.
+- **ZCM container format** (derived from `zsound/tools/raw2zcm` and `zsmkit`'s `zcm_play`):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | `$00` | 3 | `00 00 00` signature |
+  | `$03` | 3 | sample length, 24-bit little endian |
+  | `$06` | 1 | geometry (VERA `AudioCtrl` bits 5:4 — 0=mono8 1=stereo8 2=mono16 3=stereo16) |
+  | `$07` | 1 | VERA `AudioRate` byte |
+  | `$08` | var | raw PCM sample data |
+
+  Verified against `zsound/examples/simplepcm`: `shoryukEN_8kmono8bit.zcm` (12332 B, geometry `0x00`, rate 21 → 8011 Hz) and `TEST.ZCM` (135630 B, geometry `0x3F` → stereo16, rate 58 → 22125 Hz); rendered durations match byte-count / rate exactly.
+- **Bug found while wiring ZCM**: `apply_frame()` indexed `frames[frameIdx]` without bounds-checking against the populated array. ZCM (and MIDI) drive the engines directly and have **no** ZSM frame array, so a non-zero `totalFrames` caused an access violation (`0xC0000005`). Fixed with a `frameIdx >= (int)frames.size()` guard.
+- **Reversing the MIDI half (deferred, documented for later)**: melodius's MIDI engine is two layers — `src/midi.s` (available: SMF parsing, 16-channel state, 8-voice YM allocation, `VELOCITY_TO_ATTEN = max(0, ((127-vel)>>2) - 16)`, note range 13..108, uses **only** the 8 YM2151 channels and never the VERA PSG) and zsmkit's `AudioAPI` (**source unavailable** — only the 9 KB compiled `extern/zsmkit-a000.bin`).
+  - A 6502 disassembler was written (`%TEMP%\opencode\dis6502.js`) and the 39-entry JMP table recovered cleanly, e.g. `notecon_midi2fm $ABC9`, `ym_loaddefpatches $B009`, `ym_loadpatch $B12F`, `ym_playdrum $B0F4`, `ym_playnote $B15F`.
+  - **Open question blocking the port**: the MIDI-note → YM2151 `KC`/`KF` mapping. `ymfm` indexes a 768-entry phase-step table via `s_phase_step[eff_freq] >> (block ^ 7)` (`ymfm_fm.ipp:320`); the documented `fnum = (144 × freq × 2^20) / 8053920 / 4` produces `eff_freq` outside the 0..767 range and is for delta offsetting, not absolute pitch. `notecon_midi2fm` was found to use a 17-entry semitone table at `$ABFC` (`00 05 09 0E 0E 12 17 1B 1F 24 28 2D 2D 31 36 3A 3D`) whose block-splitting has not yet been recovered. Resolve this before writing the SMF parser, otherwise a wrong-timbred MIDI render is indistinguishable from a wrong patch table.
+
 ---
 
 ## 3. Comparative Research: ZSMKit vs VERA PSG (Why MIDI Sounds Different)
@@ -578,17 +626,21 @@ To make MIDI piano on VERA PSG sound substantially more authentic ("原汁原味
 | `render_pure_pcm.mjs` | Node.js | 100% Pure PCM 44.1kHz reference renderer for MOD audio comparison |
 | `extract_all_samples.mjs` | Node.js | Utility: Extract all raw MOD instruments to individual WAV files |
 | `hybridstream.asm` | 6502 ASM | Apple II 60Hz IRQ hybrid stream player (`$2000`, Slot 2 & 4) |
-| `psgplay.exe` | Win32 C (x86) | Native Windows real-time VERA PSG player (WinMM waveOut, 48kHz stereo) |
+| `psgplay.exe` | Win32 C (x86) | Native Windows real-time VERA PSG player (WinMM waveOut, 48kHz stereo); `--wav out.wav` renders offline |
 | `psgplay.c` | C | Source code for native Windows VERA PSG stream player |
 | `build_psgplay.bat` | Windows CMD | MSVC build script for compiling `psgplay.exe` |
+| `ftmplay.exe` | Win32 C++ (x64) | Standalone 2A03 FTM parser, VERA PSG synth, and WinMM player; no FamiStudio/Node/FamiTone runtime |
+| `ftmplay.cpp` | C++ | Source for native FTM parser, PSG synth, and Windows audio player |
+| `build_ftmplay.bat` | Windows CMD | MSVC build script for compiling `ftmplay.exe` |
 | `zsm2psg.mjs` | Node.js | Commander X16 ZSM (VERA PSG + YM2151 FM) → 60Hz PSG stream converter |
-| `zsmplay.exe` | Win32 C++ (x86) | Native Windows real-time ZSM player (VERA PSG + YM2151 FM via ymfm, WinMM waveOut 48kHz stereo) |
-| `zsmplay.cpp` | C++ | Source code for native Windows ZSM player |
-| `build_zsmplay.bat` | Windows CMD | MSVC build script for `zsmplay.exe` |
+| `melodius.exe` | Win32 C++ (x86) | Native Windows Commander X16 music player (VERA PSG + YM2151 FM via ymfm + VERA PCM, WinMM waveOut 48kHz stereo; `.zsm` and `.zcm`) |
+| `melodius.cpp` | C++ | Source code for the native Windows Melodius player |
+| `build_melodius.bat` | Windows CMD | MSVC build script for `melodius.exe` |
 | `zsm_scan.mjs` | Node.js | ZSM event composition analyzer (PSG/YM register histograms) |
 | `zsm_pan.mjs` | Node.js | ZSM stereo panning usage analyzer |
 | `mid2psg.mjs` | Node.js | Standard MIDI File (.mid) → 60Hz PSG register stream converter |
 | `mod2psg.mjs` | Node.js | ProTracker MOD → 60Hz PSG register stream converter |
+| `ftm2psg.mjs` | Node.js + FamiStudio | FamiTracker/FamiStudio FTM → audio-derived 60Hz VERA PSG stream (all channel stems) |
 | `wav2pcm.mjs` | Node.js | Audio → VERA 8-bit signed PCM converter (TPDF dither, presets, preview wav) |
 | `pcmstream.asm` | 6502 ASM | Apple II ProDOS direct block streaming PCM audio player |
 | `psgstream.asm` | 6502 ASM | Apple II ProDOS direct block streaming PSG event player |
@@ -609,7 +661,8 @@ build.bat
 
 # Build native Windows players
 tools\build_psgplay.bat
-tools\build_zsmplay.bat
+tools\build_ftmplay.bat
+tools\build_melodius.bat
 
 # Manual conversions
 node mod2psg.mjs space_debris.mod --no-wav
@@ -635,3 +688,86 @@ node build_jukebox.mjs
 - Both `src/startup.bas` and `src/startup_po.bas` display R7.
 - `tools/build_jukebox.mjs` produces `jukebox.po`, `jukebox.hdv`, and `jukebox.hdv.zip`. The former `sd_install/`, `sd_install.po`, and `sd_install.hdv` outputs were removed from the build.
 - PCM tracks 5 and 6 retain the SD4 player. Vera SD playback at the intended pace depends on the optimized resident driver from `verasdtool`.
+
+## FamiStudio FTM to VERA PSG Converter (2026-10-12)
+
+- Added `tools/ftm2psg.mjs`: asks FamiStudio for separate 44.1 kHz voice WAVs, estimates pitch/volume per 60 Hz frame, and writes the standard VERA `.psg` event stream.
+- Supports `--noise-gain=N` (default 1.0), `--mute-noise`, `--gain=N` (master trim) and `--no-normalize`; options also accept the space-separated form because cmd splits batch arguments at `=`. Uses `FAMISTUDIO` or common Windows install paths to locate FamiStudio.
+- This is an audio-derived approximation, not register-exact FamiTone2/APU emulation. Sample channels (DPCM) cannot be expressed as PSG registers and are reported, not encoded.
+- Validate each output with `node tools/check_psg.mjs <file.psg>` or via `build.bat ftm`.
+
+## Standalone FTM player (2026-10-12)
+
+- Replaced the temporary `ftmplay.exe` wrapper with a native C++ player in `tools/ftmplay.cpp`. It parses FTM 0.4.2–0.4.6 directly and synthesizes the 2A03 pulse, triangle, and noise channels through the VERA PSG software model. It uses WinMM for live output; no FamiStudio, Node.js, FamiTone, or companion player is needed at runtime.
+- Supports 2A03-only five-channel FTM projects. Expansion-chip voices and DPCM samples are omitted. CLI: `ftmplay.exe file.ftm [song-index] [--vol 0..15] [--solo 0..3] [--wav out.wav]`; `--list` shows song names.
+- Build with `tools/build_ftmplay.bat` (MSVC x64, statically linked CRT).
+- Bundled the source modules as `music/alterego-simpl0r.ftm` and `music/alterego-sounds.ftm`, so the player examples and tests do not need a sibling checkout. The WAV-derived `Ae-*.psg` examples were removed; only the source FTM modules are bundled. The standalone renders Title to 19.4 s (FamiStudio stem converter: 19.35 s) and Level 1 to 48.0 s (converter: 47.93 s). Also rendered Game Over and the separate sounds/start tune. Live WinMM playback was smoke-tested.
+- Fixed FTM octave conversion to use the FamiTracker note-table indexing: pulse uses 32.7032 Hz at octave 0, while triangle uses 16.3516 Hz because the same timer period runs through twice the divider. For timbre closer to the established `.psg` output, pulse voices use 25% duty, triangle level was raised, and noise maps FamiTracker's inverted NES 16-step period table directly to the corresponding APU timer rate, capped at VERA's maximum PSG frequency; noise arpeggio changes the period index. FamiStudio uses its bundled NesSndEmu 15-bit APU LFSR and Blip_Buffer resampling; VERA has a different fixed noise generator, so its timbre cannot exactly reproduce the FamiStudio WAV.
+- Corrected FamiTracker effect IDs (`B` jump, `D` break, `C` stop, `F` speed/tempo); effect `4` is no longer mistaken for song end. Level 2's `LightVibd1` uses relative pitch sequence deltas (`+2`, `+2`, `+2`, then negative values); the player now accumulates each delta into the 2A03 timer-period offset, matching FamiStudio's `ChannelState.UpdateEnvelopes`. Added `--solo 0..3` for listening to individual NES voices. Rebuilt and rendered Level 2 (43.2 s). The 2A03 0..15 volume envelope is now mapped through the inverse VERA logarithmic volume table, fixing the nearly inaudible low-volume noise hits. Live playback streams 50 ms buffers so volume controls work during play, and displays elapsed/total time plus four channel VU meters; controls are P pause, Space next song, M mute, +/- volume, Q/Esc quit. WAV output stays offline and honors `--vol`. User auditioned the direct-period noise mapping in `build/level2_noise_famistudio_ref.wav` and approved it on 2026-10-12; keep this as the accepted noise setting.
+
+### All stems are converted, not just the NES 2A03 four
+
+The first version carried a hardcoded 4-entry `VOICES` table (Square1, Square2, Triangle, Noise). Any song using an expansion chip therefore lost channels silently — a fair test song produced **8** stems and only 4 were mapped, including dropping the loudest one (`VRC6Saw`, stem RMS 0.0931).
+
+- The stem list is now **discovered** by globbing whatever `wav-export -wav-export-separate-channels` produced. Names map to waveform families: `saw`→VERA sawtooth `0x40`, `tri`→triangle `0x80`, `noise|tnm`→noise `0xC0`, `square|pulse`→pulse `0x20`; anything containing `dpcm|pcm|sample` is treated as a sample channel and reported.
+- Voice order is fixed by a `PREFERRED_ORDER` list (2A03 first, then VRC6, Sunsoft, FDS, Namco) so PSG voice indices stay stable across songs of the same project. Capped at the VERA PSG's 16 voices with a warning.
+- Conversion of the same `Nice.fms` test song went from **4 stems / Triangle 0% active** to **7 stems / Triangle 63.7%, VRC6Saw 100%**.
+
+### Pitch detection: autocorrelation replaced by FFT (measured, not guessed)
+
+The converter originally estimated pitch with normalized autocorrelation over a two- then three-frame window, plus an "octave correction" that walked toward longer periods and accepted the first lag within 85% of the best correlation. **Both the original heuristic and that correction are fundamentally invalid on musical signals**: for a periodic signal, *every integer multiple of the true period also correlates at ~1.0*, so "take the first local maximum" or "walk toward longer periods" lands on an arbitrary multiple rather than the fundamental.
+
+Measured against an independent ground truth (743 ms Hann FFT, 1.35 Hz bins, accepted only when the long window also agrees with itself ±20 frames so note changes and vibrato do not contaminate the comparison), on the Alter Ego stems:
+
+| stem | 3-frame autocorrelation | FFT 4096 |
+|---|---|---|
+| Triangle | median error **1153.8%**, 1.8% correct (up to 28x, audible as shrill squeal instead of a bass line) | median **0.2%** (3 cents), **92.1%** correct |
+| Square1 | median **71.9%**, 5.5% correct | median **0.1%** (1 cent), 63.6% correct |
+| Square2 | median **74.5%**, 11.3% correct | median **1.1%** (18 cents), 58.9% correct |
+
+The Square percentages plateau near 60% because Alter Ego has a vibrato instrument: the long truth window reports the centre of the vibrato while the detector reports the instantaneous pitch, which is the behaviour we want. **The meaningful figure is the 1-3 cent median, not the percentage.**
+
+- The detector is now a Hann-windowed FFT over a 186 ms window centred on the frame, with parabolic interpolation on log magnitude for sub-bin accuracy and a harmonic-to-fundamental correction that walks subharmonics k=8..2, taking the lowest one whose neighbourhood peak reaches 55% of the maximum. Testing a single bin for the subharmonic fails because its energy lands between bins.
+- Window size matters: 4096 (186 ms) beat 2048 decisively on Square2 (1.1% vs 19.4% median error) because a 28 Hz bass fundamental needs >5 periods to be measurable at all. The stems are decimated 2:1 (3-tap [1,2,1] lowpass) so 4096 points at 22.05 kHz span the same time and give the same 5.38 Hz bin spacing as 8192 points at 44.1 kHz, at half the cost.
+- A per-voice **pitch memory** still holds the last good frequency when a frame yields no peak, bridging note onsets instead of chopping notes off.
+- After the fix the Alter Ego title's triangle channel writes 28 Hz min / 62 Hz median / 165 Hz max — a real NES bass line — instead of the ~690 Hz median the autocorrelation produced.
+
+A previous `centeredEnergy < 1` gate also had to go: with only 367 decimated samples that is an RMS threshold of ~0.052, so a channel averaging 0.0136 could never pass and the triangle was muted for the entire song. The gate is now relative to the sample count.
+
+### Unused channels are not silent: DPCM bleed
+
+FamiStudio's `-wav-export-separate-channels` emits a stem for **every** channel, including unused ones, and an unused channel's stem is **not silence**. FamiStudio's `SeparateChannelsExportTndMode` setting bleeds DPCM samples into the triangle and noise channels.
+
+On `Nice.fms` song "Title" the Triangle channel holds **zero patterns** (the text export shows its `Channel Type="Triangle"` block occupying a single line, immediately followed by `Channel Type="Noise"`), yet `st_Triangle.wav` renders at RMS 0.0136 with 58% of frames non-zero. Its spectrum peaks at 26.9 Hz and 177.6 Hz at 0 dB each, spaced 6.73 Hz apart — that is the kick and snare **samples**, not a bass line. Converting it produced a PSG voice playing drums on a triangle wave at ~30 Hz, which is what "the triangle is all wrong" actually was. A long investigation into pitch-detection accuracy on that stem was chasing the wrong thing entirely.
+
+The fix uses `famistudio-txt-export` purely as a **channel occupancy map** — how many notes each channel has. Stems whose channel has zero notes are skipped with a warning. Tempo is not needed for this, and the text export carries none (only `famistudio-asm-export` has it, as `$47`/`$73` inside otherwise-binary note tables).
+
+After the fix `Nice.fms` converts 6 voices instead of 7, and the bass line lands correctly on `VRC6Saw` at 40-249 Hz.
+
+### Level matching is per voice
+
+A single global `peakRms` normalized against all stems meant one loud channel crushed every quiet one to silence. Each voice now gets its own reference, and the volume divisor is the geometric mean of that voice's typical level and the loudest voice's, which lifts quiet stems toward audibility without flattening the mix. `--no-normalize` restores raw relative dynamics.
+
+### Build pipeline
+
+- `build.bat ftm <in.ftm> [songIndex] [out.psg] [options]` converts and validates a FamiStudio project. It does **not** repack `jukebox.po`/`jukebox.hdv`.
+- Two cmd quirks had to be worked around: `%2` arrives with its quotes when the batch file is invoked from PowerShell (use `%~2`), and `--opt=value` is split at the `=`.
+- `psgplay.exe` gained `--wav <out.wav>` (canonical 44-byte header) so PSG streams can be rendered offline and A/B'd against a reference, matching `melodius.exe`.
+
+### Bundled Alter Ego reference (`music/alterego-simpl0r.ftm`)
+
+Song order: 0 Title, 1 Level 1, 2 Level 2, 3 Level 2 Alt, 4 Level 3, 5 Level 4, 6 Level 5, 7 Game Over, 8 Congratulations, 9 Level Clear. These use the plain NES 2A03 four, so all stems convert. The user-auditioned mix used noise gain 1.2 for TITLE and 1.0 for LEVEL1–LEVEL5.
+
+### FTM noise-period export (2026-10-12)
+
+- `ftmplay.exe` accepts `--noise-freqs <path>` to export the FTM's per-frame
+  VERA noise frequencies at 60 Hz. This uses the same inverted NES APU noise
+  period mapping as the standalone audio renderer and does not open audio.
+- The export can be consumed by a PSG patcher such as
+  `alter-ego/tools/patch_psg_noise_from_ftm.mjs`, which updates only voice 3
+  frequency registers in an existing `.psg` stream. The FamiStudio-derived
+  volume envelope and the other three voice streams stay intact. `psgplay`
+  already applies the stream's frequency register writes; this optional
+  integration does not add a dependency to `veramusic`.
+- Rebuilt `tools/ftmplay.exe` with `tools\build_ftmplay.bat`. The altered
+  Level 2 `.psg` renders through `psgplay.exe --wav` as 2,589 frames / 43.1 s.

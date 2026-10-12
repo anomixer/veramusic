@@ -32,13 +32,18 @@ Tested on:
 - **Native Windows VERA PSG Player (`tools/psgplay.exe`)**:
   - Standalone Win32 x86 real-time player to audition `.psg` streams on Windows PC with zero external dependencies.
   - Full 16-channel VERA PSG synthesis at 48,000 Hz 16-bit stereo with live 16-voice activity meters and interactive controls.
-- **Native Windows ZSM Player (`tools/zsmplay.exe`)**:
-  - Plays Commander X16 `.zsm` music files natively on Windows, rendering the 16-channel VERA PSG, the Yamaha YM2151 (OPM) FM chip, **and VERA PCM sample streams** in real time (ymfm synthesis core, zero external dependencies).
+- **Standalone Windows x64 FTM player (`tools/ftmplay.exe`)**:
+  - Reads FamiTracker `.ftm` files directly and plays their 2A03 pulse, triangle, and noise channels through a native VERA PSG software model.
+  - Requires only Windows; it does not invoke FamiStudio, Node.js, FamiTone, or `psgplay.exe`. DPCM sample playback and expansion chips are not supported.
+- **Melodius for Windows (`tools/melodius.exe`)**:
+  - A Windows port of [Melodius](https://github.com/mooinglemur/melodius), the Commander X16 music player that runs **ZSM** and **ZCM** through the X16 audio API (zsmkit).
+  - Renders the same engine the X16 uses — YM2151 (OPM) FM via ymfm, the 16-channel VERA PSG and the VERA PCM FIFO — summed 1:1 and hardware-accurately scaled, so the Commander X16 mix balance is preserved.
   - 48,000 Hz 16-bit stereo with authentic L/R panning (YM2151 pan registers `$20`–`$27` + VERA PSG stereo control bits).
-  - Adjustable FM mix gain (`--fmvol` / `F1` / `F2`, default 12.0×) — ZSM percussion and FM leads sit prominently in the mix.
-  - Adjustable PSG mix gain (`--psgvol` / `F3` / `F4`, default 12.0×) — VERA PSG voices can be boosted or attenuated.
-  - Adjustable PCM mix gain (`--pcmvol` / `F5` / `F6`, default 12.0×) — VERA PCM sample streams can be boosted over the PSG bed.
-  - Full ZSM container support: loop points, per-chip channel masks, non-60 Hz tick rates, and the PCM instrument table (mono/stereo, 8/16-bit).
+  - **ZSM** (`.zsm`/`.zm`): full container support — loop points, per-chip channel masks, non-60 Hz tick rates, EXTCMD PCM streams and the 8-byte PCM instrument table (mono/stereo, 8/16-bit).
+  - **ZCM** (`.zcm`): ZSound PCM container — `00 00 00` signature, 24-bit sample length, geometry byte and `AudioRate` byte, then raw PCM. PCM-only, so it uses just the VERA PCM FIFO.
+  - **Standard MIDI Files (`.mid`/`.midi`) are not supported by this build** — they are rejected with an explicit message. Melodius's MIDI engine has not been ported.
+  - Adjustable engine gains (`--fmvol`/`F1`/`F2`, `--psgvol`/`F3`/`F4`, `--pcmvol`/`F5`/`F6`), default **1.0×** = hardware level.
+  - `--wav out.wav` renders the whole track offline to a 48 kHz stereo WAV and exits, for A/B comparison against a reference render.
 - **Apple //e ZSM Player (`src/zsmplay.asm` → `zsmplay.po`)**:
   - A 65C02 program that writes YM2151 FM events through the VERA card's FM daughterboard registers (`VERA_BASE + $20` register select, `VERA_BASE + $21` data/status), the Apple-side equivalent of the X16's `$9F40`/`$9F41`.
   - Bootable 140KB ProDOS floppy (`zsmplay.po`) with an auto-starting Applesoft `STARTUP` that probes for a slot-2 or slot-4 VERA card before `BRUN`-ing the player.
@@ -49,7 +54,7 @@ Tested on:
   - `M`: Shadowed register mute.
   - `+` / `-`: 16-level master volume scaling.
   - `]` / `[`: Universal 5-second fast-forward and rewind.
-  - `F1` / `F2`: FM (YM2151) gain down / up (`zsmplay.exe` only).
+  - `F1` / `F2`: FM (YM2151) gain down / up (`melodius.exe` only).
   - Live on-screen display: 16-voice activity meter (`T: mm:ss.c [...] V:xx`) for PSG tracks; logical 512-byte file-chunk counter (`T: mm:ss.c B:xxxx V:xx`) for PCM stream tracks.
 
 ---
@@ -83,7 +88,7 @@ veramusic/
 ├── jukebox.hdv.zip            # Compressed 32MB hard disk image (~2.7MB, auto-generated)
 ├── jukebox.po                 # Pre-built bootable 140KB ProDOS floppy disk image
 ├── zsmplay.po                 # Pre-built bootable 140KB ProDOS floppy (Apple //e ZSM/FM player)
-├── ymfm/                      # Bundled ymfm YM2151 core (self-contained for tools/zsmplay.exe)
+├── ymfm/                      # Bundled ymfm YM2151 core (self-contained for tools/melodius.exe)
 │   ├── ymfm.h                 # ymfm core base
 │   ├── ymfm_fm.h              # FM engine declarations
 │   ├── ymfm_fm.ipp            # FM engine implementation
@@ -110,9 +115,12 @@ veramusic/
 │   ├── psgplay.exe            # Native Windows x86 real-time VERA PSG player
 │   ├── psgplay.c              # Source code for psgplay (WinMM waveOut 48kHz audio)
 │   ├── build_psgplay.bat      # MSVC build script for psgplay.exe
-│   ├── zsmplay.exe            # Native Windows x86 real-time ZSM (VERA PSG + YM2151 FM + VERA PCM) player
-│   ├── zsmplay.cpp            # Source code for zsmplay (ymfm YM2151 + VERA PSG + VERA PCM + WinMM)
-│   ├── build_zsmplay.bat      # MSVC build script for zsmplay.exe
+│   ├── ftmplay.exe            # Standalone Windows FTM → VERA PSG player
+│   ├── ftmplay.cpp           # Native FTM parser, PSG synth, and WinMM player
+│   ├── build_ftmplay.bat      # MSVC build script for ftmplay.exe
+│   ├── melodius.exe            # Native Windows x86 Commander X16 ZSM/ZCM player
+│   ├── melodius.cpp            # Source code for melodius (ymfm YM2151 + VERA PSG + VERA PCM + WinMM)
+│   ├── build_melodius.bat      # MSVC build script for melodius.exe
 │   ├── build_zsmplay_po.mjs   # Packs zsmplay.po (ZSMPLAY.BIN + STARTUP) from the ProDOS template
 │   ├── zsm_scan.mjs           # ZSM analyzer (event histogram + header/PCM table dump)
 │   ├── zsm_pan.mjs            # ZSM stereo panning usage analyzer
@@ -122,7 +130,9 @@ veramusic/
 │   ├── wav2pcm.mjs            # Audio (.wav/.mp3) → 8010 Hz VERA PCM converter
 │   ├── build_jukebox.mjs      # ProDOS volume packager & automatic ZIP generator
 │   └── check_psg.mjs          # 6502 cycle & register write validator
-├── music/                     # Audio source assets & converted streams (.mid, .mod, .psg, .pcm)
+├── music/                     # Source projects and converted streams (.ftm, .mid, .mod, .psg, .pcm)
+│   ├── alterego-simpl0r.ftm  # Bundled 2A03 reference module (10 songs)
+│   └── alterego-sounds.ftm    # Bundled 2A03 sound-effects/start-tune module
 └── scripts/                   # Audio analysis & one-off diagnostic utilities
 ```
 
@@ -171,7 +181,20 @@ node tools/wav2pcm.mjs music/alexander-nakarada-the-wellerman.mp3 music/wellerma
 
 # Convert Commander X16 ZSM tracks to 60 Hz PSG streams
 node tools/zsm2psg.mjs
+
+# Convert a FamiTracker/FamiStudio .ftm song to VERA PSG events
+node tools/ftm2psg.mjs song.ftm 0 music/TITLE.psg --noise-gain=1.2
 ```
+
+`ftm2psg.mjs` requires FamiStudio 4.5 or newer. Set `FAMISTUDIO` if its
+executable is not in a standard Windows install location. Song indices are
+zero-based and follow the order in the FTM project. The converter asks
+FamiStudio for separate 44.1 kHz channel WAVs, then estimates pitch and volume
+at 60 Hz; this is an audio-derived approximation, not a register-exact NES
+APU/FamiTone2 conversion. `--noise-gain=N` tunes the VERA noise voice (default
+1.0), and `--mute-noise` disables it. DPCM samples are omitted because standard
+`.psg` streams contain PSG register writes only. Validate output with
+`node tools/check_psg.mjs music/TITLE.psg`.
 
 ### Auditioning PSG Streams on Windows (`psgplay.exe`)
 A standalone native Win32 tool is provided in `tools/psgplay.exe` to play any `.psg` file directly on Windows:
@@ -198,25 +221,40 @@ psgplay.exe ..\music\HIGHSCORE.psg --vol 12
 - `L`: Toggle looping on / off
 - `ESC` or `Q`: Quit player
 
-### Auditioning ZSM Files on Windows (`zsmplay.exe`)
-`tools/zsmplay.exe` plays original Commander X16 `.zsm` music files — **including the YM2151 FM parts** that `zsm2psg.mjs` discards when transcoding to `.psg`, **and the VERA PCM sample streams** (e.g. `TREE.ZSM`):
+### Playing FamiTracker `.ftm` files on Windows (`ftmplay.exe`)
+
+The standalone player and two 2A03 FTM examples are included in this repository. The Alter Ego examples are source modules; generated `Ae-*.psg` files are not bundled. Run a song by passing its project and zero-based song index:
+```cmd
+tools\ftmplay.exe music\alterego-simpl0r.ftm 0
+```
+
+Use `tools\ftmplay.exe music\alterego-simpl0r.ftm --list` to show song indices. The second bundled project can be listed with `tools\ftmplay.exe music\alterego-sounds.ftm --list`. Optional `--vol 0..15` sets the initial volume, `--solo 0..3` renders only Square1, Square2, Triangle, or Noise, `--wav out.wav` writes a PCM render, and `--noise-freqs out.txt` exports the NES noise pitch for each 60 Hz frame without audio playback. This native player parses FTM 0.4.2–0.4.6 2A03 modules and maps their pulse, triangle, and noise voices to VERA PSG waveforms; for a closer match to the existing `.psg` converter it uses 25% pulse waves and maps FamiTracker's inverted NES noise-period table directly to its APU timer rate, capped at VERA's maximum PSG frequency. Relative FamiTracker pitch sequence values accumulate as APU timer-period deltas. The live player shows elapsed/total time and four channel VU meters; P pauses, Space advances to the next song, M mutes, +/- adjusts volume, and Q/Esc quits. DPCM and expansion-chip channels are omitted. It synthesizes directly from FTM patterns and envelopes without FamiTone bytecode or an intermediate `.psg` file. Run `tools\build_ftmplay.bat` to rebuild the Windows x64 executable with MSVC C++ Build Tools.
+
+### Auditioning X16 Music Files on Windows (`melodius.exe`)
+`tools/melodius.exe` plays Commander X16 music files — **`.zsm`** (including the YM2151 FM parts that `zsm2psg.mjs` discards when transcoding to `.psg`, and the VERA PCM sample streams such as `TREE.ZSM`) and **`.zcm`** (ZSound PCM containers). Standard MIDI Files are **not** supported by this build.
 ```cmd
 cd tools
 
 # Play any ZSM track (loops by default if a loop point exists)
-zsmplay.exe ..\music\CANYON.ZSM
+melodius.exe ..\music\CANYON.ZSM
 
-# Boost the FM (YM2151) mix — drums & percussion live here (default gain 12.0)
-zsmplay.exe CANYON.ZSM --fmvol 4.0
+# Play a ZCM (PCM-only container)
+melodius.exe ..\assets\shoryukEN_8kmono8bit.zcm --no-loop
+
+# Boost the FM (YM2151) mix — drums & percussion live here (default gain 1.0 = hardware level)
+melodius.exe CANYON.ZSM --fmvol 4.0
 
 # One-shot playback (do not loop)
-zsmplay.exe TITLE.ZSM --no-loop
+melodius.exe TITLE.ZSM --no-loop
 
-# Set initial master volume (0..15)
-zsmplay.exe HIGHSCORE.ZSM --vol 12
+# Set initial master volume (0..15, default 12)
+melodius.exe HIGHSCORE.ZSM --vol 12
+
+# Render offline to a WAV instead of playing
+melodius.exe TITLE.ZSM --wav out.wav
 
 # PCM-only track (plays the embedded sample stream, auto-exits at end)
-zsmplay.exe TREE.ZSM
+melodius.exe TREE.ZSM
 ```
 
 **Interactive Controls**:
@@ -233,14 +271,14 @@ zsmplay.exe TREE.ZSM
 
 **Real-Time Status Bar**:
 ```text
-[TITLE.ZSM   ] 00:00/00:55 [>               ] [.......^..........] V:15 FM:12.00 PSG:12.00 PCM:12.00 [LOOP]
+[TITLE.ZSM   ] 00:00/00:55 [>               ] [.......^..........] V:12 FM:1.00 PSG:1.00 PCM:1.00 [LOOP]
 ```
 - **`T: mm:ss`**: Elapsed / total playback time.
 - **`[...]`**: 18-character activity meter. For FM+PSG tracks (ZSM `fmMask` ≠ 0): slots 0-7 = YM2151 FM channels 0-7 (`^` = key-on, `.` = off), slots 8-15 = VERA PSG voices 0-7 (symbol guide below), slots 16-17 = VERA PCM L/R output level. For pure-PSG tracks: slots 0-15 = PSG voices 0-15, slots 16-17 = PCM L/R.
-- **`V:xx`**: Master volume level (0 to 15).
-- **`FM:x.xx`**: Current YM2151 FM mix gain (adjustable live with `F1`/`F2`).
-- **`PSG:x.xx`**: Current VERA PSG mix gain (adjustable live with `F3`/`F4`).
-- **`PCM:x.xx`**: Current VERA PCM mix gain (adjustable live with `F5`/`F6`).
+- **`V:xx`**: Master volume level (0 to 15, defaults to **12**; `+`/`-` adjust, `--vol N` sets it at startup).
+- **`FM:x.xx`**: Current YM2151 FM mix gain (adjustable live with `F1`/`F2`, default 1.00 = hardware level).
+- **`PSG:x.xx`**: Current VERA PSG mix gain (adjustable live with `F3`/`F4`, default 1.00 = hardware level).
+- **`PCM:x.xx`**: Current VERA PCM mix gain (adjustable live with `F5`/`F6`, default 1.00 = hardware level).
 - **`[LOOP]`**: Loop / repeat (`REPT`) / one-shot (`1SHT`) / paused (`PAUS`) / muted (`MUTE`) state. Tracks with no loop point play once and exit automatically.
 
 **Stereo**: Both engines output true stereo — YM2151 per-channel panning (registers `$20`–`$27`: bit 6 = left, bit 7 = right) and VERA PSG per-voice stereo control bits. Tracks like `TITLE.ZSM` and `KILLED.ZSM` pan voices across the stereo field.
@@ -309,7 +347,7 @@ T: mm:ss.c B:xxxx V:15
   - Auto-detected at boot by reading and writing VERA scratch registers.
 - **YM2151 FM (AppleWin VERA fork only)**:
   - Register select at slot base + `$20`, data at slot base + `$21` (e.g. `$C220` / `$C221` on Slot 2).
-  - Not present on physical VERA cards — emulated by the AppleWin fork with the ymfm core; `tools/zsmplay.exe` renders the identical mix natively on Windows.
+  - Not present on physical VERA cards — emulated by the AppleWin fork with the ymfm core; `tools/melodius.exe` renders the identical mix natively on Windows.
 
 ---
 

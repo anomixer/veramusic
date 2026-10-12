@@ -1,12 +1,20 @@
 /**
- * zsmplay.cpp — Native Windows FM (YM2151) + VERA PSG ZSM Player
+ * melodius.cpp - Native Windows player for Commander X16 / ZSound music
  *
- * Plays Commander X16 ZSM music files (.zsm) natively on Windows, rendering
- * both the VERA PSG (16 channels) and the YM2151 (FM) audio paths with
- * ymfm. Zero external dependencies.
+ * A Windows port of Melodius (https://github.com/mooinglemur/melodius), the
+ * Commander X16 music player that runs ZSM and ZCM through the X16 audio API
+ * (zsmkit). On the X16 both formats are driven by the same engine: the YM2151
+ * (FM), the VERA PSG and the VERA PCM FIFO, mixed by the VERA DAC.
+ *
+ * This build reproduces that engine natively on Windows using ymfm for the
+ * YM2151, so ZSM and ZCM playback matches the Commander X16 mix. Melodius's
+ * Standard MIDI File engine is NOT ported here.
+ *
+ * Supported: .zsm/.zm (YSM/ZSMKit stream), .zcm (ZSound PCM container)
  *
  * Usage:
- *   zsmplay.exe <file.zsm> [--no-loop] [--vol 0..15] [--time N]
+ *   melodius.exe <file.zsm|.zcm> [--no-loop] [--vol 0..15] [--time N]
+ *              [--fmvol G] [--psgvol G] [--pcmvol G] [--wav out.wav]
  *
  * Controls:
  *   [SPACE] or [P]  Pause / Resume
@@ -43,6 +51,9 @@
 #define SAMPLES_PER_BUF (SAMPLES_PER_FRAME * FRAMES_PER_BUF)
 #define NUM_BUFFERS 4
 #define PSG_CLOCK (25000000.0 / 512.0) // 48828.125 Hz
+// The VERA PSG phase accumulator runs 0..0x20000 (17-bit) and advances by
+// freq * (PSG_CLOCK / sampleRate); see VERAAudio.cpp renderSample().
+#define PSG_PHASE_SCALE (PSG_CLOCK / (double)SAMPLE_RATE)
 
 // 64-entry VERA logarithmic volume lookup table (same as psgplay.c)
 static const uint16_t volumeLut[64] = {
@@ -57,7 +68,8 @@ static const uint16_t volumeLut[64] = {
 // ---------------------------------------------------------------------------
 typedef struct {
   uint8_t regs[64];
-  double phase[16];
+  double phase[16];      // 0..0x20000 VERA fixed-point phase accumulator
+  int32_t noiseVal[16];  // 6-bit noise sample latched per voice (0x00..0x3F)
   uint32_t noiseState;
 } PsgState;
 
@@ -65,8 +77,10 @@ static PsgState psg;
 
 static void psg_reset(void) {
   memset(psg.regs, 0, sizeof(psg.regs));
-  for (int i = 0; i < 16; i++)
+  for (int i = 0; i < 16; i++) {
     psg.phase[i] = 0.0;
+    psg.noiseVal[i] = 0;
+  }
   psg.noiseState = 1;
 }
 
@@ -337,13 +351,129 @@ static bool load_zsm_file(const char *filename) {
 }
 
 // ---------------------------------------------------------------------------
+// File kind detection
+// ---------------------------------------------------------------------------
+enum FileKind { KIND_NONE, KIND_ZSM, KIND_ZCM, KIND_MID };
+
+static FileKind fileKind = KIND_NONE;
+
+static FileKind detect_kind(const char *path) {
+  size_t n = strlen(path);
+  const char *dot = NULL;
+  for (size_t i = n; i > 0; i--) {
+    if (path[i - 1] == '\\' || path[i - 1] == '/')
+      break;
+    if (path[i - 1] == '.' && !dot)
+      dot = path + i - 1;
+  }
+  if (!dot)
+    return KIND_NONE;
+  char ext[8];
+  size_t k = 0;
+  for (const char *p = dot + 1; *p && k < sizeof(ext) - 1; p++)
+    ext[k++] = (char)tolower((unsigned char)*p);
+  ext[k] = 0;
+  if (!strcmp(ext, "zsm") || !strcmp(ext, "zm"))
+    return KIND_ZSM;
+  if (!strcmp(ext, "zcm"))
+    return KIND_ZCM;
+  if (!strcmp(ext, "mid") || !strcmp(ext, "midi"))
+    return KIND_MID;
+  return KIND_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// ZCM - ZSound PCM container
+//
+// Layout (see zsound/tools/raw2zcm and zsmkit's zcm_play):
+//   $00..$02  00 00 00 signature
+//   $03..$05  sample length, 24-bit little endian
+//   $06       geometry (AudioCtrl bits 5:4: 0=mono8 1=stereo8 2=mono16 3=stereo16)
+//   $07       VERA AudioRate byte
+//   $08..     PCM sample data
+// ---------------------------------------------------------------------------
+static bool read_whole_file(const char *filename) {
+  FILE *fp = fopen(filename, "rb");
+  if (!fp)
+    return false;
+  fseek(fp, 0, SEEK_END);
+  long sz = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+  if (sz <= 0) {
+    fclose(fp);
+    return false;
+  }
+  streamSize = (size_t)sz;
+  streamData = (uint8_t *)malloc(streamSize);
+  if (!streamData) {
+    fclose(fp);
+    return false;
+  }
+  size_t got = fread(streamData, 1, streamSize, fp);
+  fclose(fp);
+  if (got != streamSize) {
+    free(streamData);
+    streamData = NULL;
+    return false;
+  }
+  return true;
+}
+
+static bool load_zcm_file(const char *filename) {
+  if (!read_whole_file(filename))
+    return false;
+  if (streamSize < 8) {
+    printf("Error: file is too small to be a ZCM\n");
+    return false;
+  }
+  if (streamData[0] || streamData[1] || streamData[2])
+    printf("Warning: ZCM signature is missing (expected 00 00 00)\n");
+
+  PcmInst inst;
+  inst.fileOffset = 8;
+  inst.length =
+      streamData[3] | (streamData[4] << 8) | (streamData[5] << 16);
+  if (inst.length == 0 || 8 + (size_t)inst.length > streamSize)
+    inst.length = (uint32_t)(streamSize - 8);
+  inst.geometry = streamData[6];
+  inst.looped = false;
+  inst.loopPoint = 0;
+  pcmInsts.clear();
+  pcmInsts.push_back(inst);
+
+  pcmTriggerTick = 0;
+  pcmRateByte = streamData[7];
+  pcmFormat = (streamData[6] >> 4) & 3;
+  pcmVolume = 15;
+  pcm_trigger(0);
+
+  const int bytesPerSample =
+      ((pcmFormat & 1) ? 2 : 1) * ((pcmFormat & 2) ? 2 : 1);
+  const int effRate =
+      (pcmRateByte > 128) ? (256 - pcmRateByte) : pcmRateByte;
+  const double pcmHz = (double)effRate * (48828.125 / 128.0);
+  const double seconds =
+      pcmHz > 0 ? (double)pcmInsts[0].length / bytesPerSample / pcmHz : 0.0;
+  totalFrames = (int)(seconds * FPS) + 1;
+  hasLoop = false;
+  printf(" PCM: %u bytes, geometry 0x%02X (%s%d-bit), rate %d (%.0f Hz)\n",
+         pcmInsts[0].length, pcmFormat,
+         (pcmFormat == 1 || pcmFormat == 3) ? "stereo" : "mono",
+         (pcmFormat >= 2) ? 16 : 8, effRate, pcmHz);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Player state
 // ---------------------------------------------------------------------------
 static int currentFrame = 0;
-static int masterVolume = 15; // 0..15
-static double fmGain = 12.0;  // FM (YM2151) mix gain
-static double pcmGain = 12.0;  // VERA PCM mix gain (F5/F6)
-static double psgGain = 12.0;  // VERA PSG mix gain (F3/F4)
+static int masterVolume = 12; // 0..15
+// Hardware-accurate mix gains. VERACard.cpp sums the VERA PSG and the YM2151
+// daughterboard 1:1 (`mixed = psg + ym`), so all three engines default to 1.0
+// and the balance between them matches the real Apple II / X16 output.
+static double fmGain = 1.0;   // FM (YM2151) mix gain
+static double pcmGain = 1.0;  // VERA PCM mix gain (F5/F6)
+static double psgGain = 1.0;  // VERA PSG mix gain (F3/F4)
 static bool isMuted = false;
 static bool isPaused = false;
 static bool isRunning = true;
@@ -352,6 +482,7 @@ static double tickAccum = 0.0; // ZSM tick accumulator (normalizes non-60Hz tick
 static double timeoutSeconds = 0.0;
 static uint8_t channelVols[16] = {0};
 static bool loopEnabled = true;
+static const char *wavOutPath = NULL;
 
 static HWAVEOUT hWaveOut = NULL;
 static WAVEHDR waveHeaders[NUM_BUFFERS];
@@ -360,6 +491,9 @@ static int16_t *audioBuffers[NUM_BUFFERS];
 // Apply all register writes for a specific frame
 static void apply_frame(int frameIdx) {
   if (frameIdx < 0 || frameIdx >= totalFrames)
+    return;
+  // ZCM and MIDI drive the engines directly and have no ZSM frame array.
+  if (frameIdx >= (int)frames.size())
     return;
   applyTick = frameIdx;
   Frame &f = frames[frameIdx];
@@ -485,7 +619,6 @@ static void render_frame(int16_t *outBuffer) {
                        (psg.noiseState >> 4) ^ (psg.noiseState >> 15)) &
                       1);
     psg.noiseState &= 0xFFFF;
-    float noiseVal = (psg.noiseState & 1) ? 1.0f : -1.0f;
 
     float psgL = 0.0f, psgR = 0.0f;
     for (int ch = 0; ch < 16; ch++) {
@@ -493,40 +626,61 @@ static void render_frame(int16_t *outBuffer) {
         continue; // voice masked off by the ZSM header
       uint8_t ctrl = psg.regs[ch * 4 + 2];
       uint8_t volIdx = ctrl & 0x3F;
-      if (volIdx == 0)
-        continue;
 
       bool left = (ctrl & 0x40) != 0;
       bool right = (ctrl & 0x80) != 0;
       if (!left && !right)
-        continue;
+        continue; // muted voice: the hardware stops clocking its phase
 
       uint16_t freq = psg.regs[ch * 4] | (psg.regs[ch * 4 + 1] << 8);
-      double step = ((double)freq / 131072.0) * (PSG_CLOCK / (double)SAMPLE_RATE);
-      psg.phase[ch] += step;
-      if (psg.phase[ch] >= 1.0) {
-        psg.phase[ch] -= floor(psg.phase[ch]);
-      }
-      double p = psg.phase[ch];
-
       uint8_t waveReg = psg.regs[ch * 4 + 3];
-      uint8_t waveType = (waveReg >> 6) & 3;
+      uint8_t waveType = waveReg >> 6;
       uint8_t pw = waveReg & 0x3F;
 
-      float samp = 0.0f;
-      if (waveType == 0) { // Pulse
-        double duty = (pw + 1.0) / 128.0;
-        samp = (p < duty) ? 1.0f : -1.0f;
-      } else if (waveType == 1) { // Sawtooth
-        samp = (float)(2.0 * p - 1.0);
-      } else if (waveType == 2) { // Triangle
-        samp = (float)(p < 0.5 ? (4.0 * p - 1.0) : (3.0 - 4.0 * p));
-      } else { // Noise
-        samp = noiseVal;
+      // 17-bit phase accumulator, 0..0x20000 (VERAAudio.cpp)
+      const uint32_t oldPhase = (uint32_t)psg.phase[ch];
+      double newPhase = psg.phase[ch] + freq * PSG_PHASE_SCALE;
+      newPhase = fmod(newPhase, 0x20000);
+      const uint32_t newPhaseInt = (uint32_t)newPhase;
+      // Each voice latches its own 6-bit noise sample at every half-period,
+      // so the noise is band-limited to the voice frequency instead of being
+      // full-bandwidth hiss, and voices are decorrelated from each other.
+      if ((oldPhase & 0x10000) && !(newPhaseInt & 0x10000))
+        psg.noiseVal[ch] = (int32_t)((psg.noiseState >> 1) & 0x3F);
+      psg.phase[ch] = newPhase;
+
+      // 6-bit unsigned waveform value
+      int32_t v = 0;
+      switch (waveType) {
+      case 0: // pulse
+        v = ((newPhaseInt >> 10) > pw) ? 0 : 0x3F;
+        break;
+      case 1: // sawtooth (phase offset by the pulse-width field)
+        v = (int32_t)(newPhaseInt >> 11) ^ (int32_t)((pw ^ 0x3F) & 0x3F);
+        break;
+      case 2: // triangle
+        v = (int32_t)((newPhaseInt & 0x10000) ? (~(newPhaseInt >> 10) & 0x3F)
+                                             : ((newPhaseInt >> 10) & 0x3F)) ^
+            (int32_t)((pw ^ 0x3F) & 0x3F);
+        break;
+      default: // noise
+        v = psg.noiseVal[ch];
+        break;
       }
 
-      float volAmp = volumeLut[volIdx] / 511.0f;
-      float voiceSig = samp * volAmp;
+      // 6-bit unsigned -> sign-extended 6-bit, range -32..+31
+      int32_t sv = v ^ 0x20;
+      if (sv & 0x20)
+        sv |= 0xFFC0;
+      sv = (sv << 16) >> 16;
+
+      // Hardware voice level: every voice is attenuated by 3 bits, so one
+      // voice at full volume is ~1980/32767 and all 16 sum to just under full
+      // scale (VERAAudio.cpp: l += (sv * volume) >> 3). Treating one voice as
+      // full scale made the PSG ~16x too loud, which pinned the tanh limiter
+      // and buried the YM2151 percussion.
+      const float voiceSig =
+          (float)sv * (float)volumeLut[volIdx] * (1.0f / 262144.0f);
 
       if (left)
         psgL += voiceSig;
@@ -608,9 +762,11 @@ static void render_frame(int16_t *outBuffer) {
     mixL *= effVol;
     mixR *= effVol;
 
-    // Soft analog-style tanh saturation
-    float satL = tanhf(mixL / 8.0f);
-    float satR = tanhf(mixR / 8.0f);
+    // Soft analog-style tanh saturation. With hardware-accurate engine levels
+    // a busy 8-channel FM arrangement peaks near 0.9, so a 2.0x drive keeps
+    // the mix loud while leaving headroom for percussion transients.
+    float satL = tanhf(mixL * 2.0f);
+    float satR = tanhf(mixR * 2.0f);
 
     int32_t valL = (int32_t)(satL * 30000.0f);
     int32_t valR = (int32_t)(satR * 30000.0f);
@@ -732,6 +888,8 @@ int main(int argc, char **argv) {
       pcmGain = atof(argv[++i]);
       if (pcmGain < 0.0) pcmGain = 0.0;
       if (pcmGain > 16.0) pcmGain = 16.0;
+    } else if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
+      wavOutPath = argv[++i];
     } else if ((strcmp(argv[i], "--time") == 0 || strcmp(argv[i], "--timeout") == 0) && i + 1 < argc) {
       timeoutSeconds = atof(argv[++i]);
     } else if (argv[i][0] != '-') {
@@ -741,13 +899,18 @@ int main(int argc, char **argv) {
 
   if (!filePath) {
     printf("========================================================\n");
-    printf(" FM + PSG + PCM ZSM Player for Windows (zsmplay v1.1)\n");
+    printf(" Melodius for Windows - Commander X16 ZSM / ZCM player\n");
+    printf(" YM2151 (FM) + VERA PSG + VERA PCM, hardware-accurate mix\n");
     printf("========================================================\n");
     printf("Usage:\n");
-    printf("  zsmplay.exe <file.zsm> [--no-loop] [--vol 0..15] [--fmvol 0.25..16] [--psgvol 0.25..16] [--pcmvol 0.25..16] [--time N]\n\n");
+    printf("  melodius.exe <file.zsm|.zcm> [--no-loop] [--vol 0..15] [--fmvol 0.25..16] [--psgvol 0.25..16] [--pcmvol 0.25..16] [--time N] [--wav out.wav]\n\n");
+    printf("  Engine gains default to 1.0 (hardware-accurate VERA PSG / YM2151 mix);\n");
+    printf("  use --fmvol/--psgvol/--pcmvol (or F1..F6) to rebalance.\n");
+    printf("  --wav renders the whole song offline to a 48 kHz stereo WAV and exits.\n");
+    printf("  (.mid playback is not included in this build)\n\n");
     printf("Examples:\n");
-    printf("  zsmplay.exe TITLE.ZSM\n");
-    printf("  zsmplay.exe ..\\assets\\CANYON.ZSM --fmvol 4.0\n\n");
+    printf("  melodius.exe TITLE.ZSM\n");
+    printf("  melodius.exe CANYON.ZSM --fmvol 4.0\n\n");
     printf("Looking for .zsm files in current folder:\n");
 
     WIN32_FIND_DATAA fd;
@@ -771,14 +934,79 @@ int main(int argc, char **argv) {
     baseName = strrchr(filePath, '/');
   baseName = baseName ? baseName + 1 : filePath;
 
-  if (!load_zsm_file(filePath)) {
+  fileKind = detect_kind(filePath);
+  if (fileKind == KIND_MID) {
+    printf("Error: Standard MIDI File (.mid) playback is not part of this "
+           "build.\n");
+    printf("       Supported: .zsm/.zm (ZSMKit stream) and .zcm "
+           "(ZSound PCM container).\n");
     return 1;
   }
+  if (fileKind == KIND_NONE) {
+    printf("Error: cannot determine file type of '%s' "
+           "(expected .zsm/.zm or .zcm)\n",
+           filePath);
+    return 1;
+  }
+
+  bool loaded = false;
+  switch (fileKind) {
+  case KIND_ZCM:
+    loaded = load_zcm_file(filePath);
+    break;
+  default:
+    loaded = load_zsm_file(filePath);
+    break;
+  }
+  if (!loaded)
+    return 1;
 
   ym2151 = new ymfm::ym2151(ymif);
   ym_reset();
   psg_reset();
   memset(channelVols, 0, sizeof(channelVols));
+
+  // Offline render: write the whole song to a 48 kHz stereo WAV using exactly
+  // the same DSP as live playback, then exit without touching waveOut. Useful
+  // for A/B comparison against a reference render.
+  if (wavOutPath) {
+    FILE *w = fopen(wavOutPath, "wb");
+    if (!w) {
+      printf("Error: cannot open '%s' for writing\n", wavOutPath);
+      return 1;
+    }
+    // Canonical 44-byte WAV header: RIFF/WAVE + 16-byte fmt chunk
+    // (audioFormat, channels, sampleRate, byteRate, blockAlign, bitsPerSample)
+    // + data chunk.
+    const uint32_t dataBytes = (uint32_t)(totalFrames * SAMPLES_PER_FRAME * 4);
+    const uint16_t fmtSize = 16, audioFormat = WAVE_FORMAT_PCM;
+    const uint16_t chn = 2, bits = 16, blkAlign = 4;
+    const uint32_t rate = SAMPLE_RATE, byteRate = rate * blkAlign;
+    const uint32_t riffSize = 36 + dataBytes;
+    fwrite("RIFF", 1, 4, w);
+    fwrite(&riffSize, 4, 1, w);
+    fwrite("WAVE", 1, 4, w);
+    fwrite("fmt ", 1, 4, w);
+    fwrite(&fmtSize, 4, 1, w);
+    fwrite(&audioFormat, 2, 1, w);
+    fwrite(&chn, 2, 1, w);
+    fwrite(&rate, 4, 1, w);
+    fwrite(&byteRate, 4, 1, w);
+    fwrite(&blkAlign, 2, 1, w);
+    fwrite(&bits, 2, 1, w);
+    fwrite("data", 1, 4, w);
+    fwrite(&dataBytes, 4, 1, w);
+
+    std::vector<int16_t> frameBuf(SAMPLES_PER_FRAME * 2);
+    for (int f = 0; f < totalFrames; f++) {
+      render_frame(frameBuf.data());
+      fwrite(frameBuf.data(), 2, frameBuf.size(), w);
+    }
+    fclose(w);
+    printf("Wrote %s (%d frames, %.1fs, FM:%.2f PSG:%.2f PCM:%.2f)\n", wavOutPath,
+           totalFrames, totalFrames / 60.0, fmGain, psgGain, pcmGain);
+    return 0;
+  }
 
   // Initialize Win32 waveOut
   WAVEFORMATEX wfx;
@@ -823,7 +1051,7 @@ int main(int argc, char **argv) {
   }
 
   printf("============================================================================================================\n");
-  printf(" FM + PSG + PCM ZSM Player -- %s\n", baseName);
+  printf(" Melodius (YM2151 + VERA PSG + VERA PCM) -- %s\n", baseName);
   printf(" Frames: %d (%.1fs) | Loop Frame: %d | Stream: %zu bytes\n", totalFrames,
          totalFrames / 60.0, loopFrame, streamSize);
   if (!pcmInsts.empty()) {

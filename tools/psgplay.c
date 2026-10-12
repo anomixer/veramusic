@@ -37,6 +37,9 @@
 #define SAMPLES_PER_BUF (SAMPLES_PER_FRAME * FRAMES_PER_BUF)
 #define NUM_BUFFERS 4
 #define PSG_CLOCK (25000000.0 / 512.0) // 48828.125 Hz
+// The VERA PSG phase accumulator runs 0..0x20000 (17-bit) and advances by
+// freq * (PSG_CLOCK / sampleRate) — see VERAAudio.cpp renderSample().
+#define PSG_PHASE_SCALE (PSG_CLOCK / (double)SAMPLE_RATE)
 
 // 64-entry VERA logarithmic volume lookup table
 static const uint16_t volumeLut[64] = {
@@ -48,7 +51,8 @@ static const uint16_t volumeLut[64] = {
 
 typedef struct {
   uint8_t regs[64];
-  double phase[16];
+  double phase[16];      // 0..0x20000 VERA fixed-point phase accumulator
+  int32_t noiseVal[16];  // 6-bit noise sample latched per voice (0x00..0x3F)
   uint32_t noiseState;
 } PsgState;
 
@@ -65,12 +69,13 @@ static bool loopEnabled = true;
 
 // Player state
 static int currentFrame = 0;
-static int masterVolume = 15; // 0..15
+static int masterVolume = 12; // 0..15
 static bool isMuted = false;
 static bool isPaused = false;
 static bool isRunning = true;
 static bool songFinished = false;
 static double timeoutSeconds = 0.0;
+static const char *wavOutPath = NULL;
 static uint8_t channelVols[16] = {0};
 
 // Audio buffers
@@ -83,6 +88,7 @@ static void psg_reset(void) {
   memset(psg.regs, 0, sizeof(psg.regs));
   for (int i = 0; i < 16; i++) {
     psg.phase[i] = 0.0;
+    psg.noiseVal[i] = 0;
   }
   psg.noiseState = 1;
 }
@@ -214,54 +220,72 @@ static void render_frame(int16_t *outBuffer) {
   for (int s = 0; s < SAMPLES_PER_FRAME; s++) {
     float mixL = 0.0f, mixR = 0.0f;
 
-    // Advance 16-bit Galois LFSR for noise
+    // The VERA clocks the noise LFSR once per output sample, not once per
+    // voice (clocking it per voice made the noise far too fast).
     psg.noiseState = (psg.noiseState << 1) |
                      (((psg.noiseState >> 1) ^ (psg.noiseState >> 2) ^
                        (psg.noiseState >> 4) ^ (psg.noiseState >> 15)) &
                       1);
     psg.noiseState &= 0xFFFF;
-    float noiseVal = (psg.noiseState & 1) ? 1.0f : -1.0f;
 
     for (int ch = 0; ch < 16; ch++) {
       uint8_t ctrl = psg.regs[ch * 4 + 2];
       uint8_t volIdx = ctrl & 0x3F;
       if (s == 0)
         channelVols[ch] = volIdx;
-      if (volIdx == 0)
-        continue;
 
       bool left = (ctrl & 0x40) != 0;
       bool right = (ctrl & 0x80) != 0;
       if (!left && !right)
-        continue;
+        continue; // muted voice: the hardware stops clocking its phase
 
       uint16_t freq = psg.regs[ch * 4] | (psg.regs[ch * 4 + 1] << 8);
-      double step =
-          ((double)freq / 131072.0) * (PSG_CLOCK / (double)SAMPLE_RATE);
-      psg.phase[ch] += step;
-      if (psg.phase[ch] >= 1.0) {
-        psg.phase[ch] -= floor(psg.phase[ch]);
-      }
-      double p = psg.phase[ch];
-
       uint8_t waveReg = psg.regs[ch * 4 + 3];
-      uint8_t waveType = (waveReg >> 6) & 3;
+      uint8_t waveType = waveReg >> 6;
       uint8_t pw = waveReg & 0x3F;
 
-      float samp = 0.0f;
-      if (waveType == 0) { // Pulse
-        double duty = (pw + 1.0) / 128.0;
-        samp = (p < duty) ? 1.0f : -1.0f;
-      } else if (waveType == 1) { // Sawtooth
-        samp = (float)(2.0 * p - 1.0);
-      } else if (waveType == 2) { // Triangle
-        samp = (float)(p < 0.5 ? (4.0 * p - 1.0) : (3.0 - 4.0 * p));
-      } else { // Noise
-        samp = noiseVal;
+      // 17-bit phase accumulator, 0..0x20000 (VERAAudio.cpp)
+      const uint32_t oldPhase = (uint32_t)psg.phase[ch];
+      double newPhase = psg.phase[ch] + freq * PSG_PHASE_SCALE;
+      newPhase = fmod(newPhase, 0x20000);
+      const uint32_t newPhaseInt = (uint32_t)newPhase;
+      // Each voice latches its own 6-bit noise sample at every half-period,
+      // so the noise is band-limited to the voice frequency instead of being
+      // full-bandwidth hiss, and voices are decorrelated from each other.
+      if ((oldPhase & 0x10000) && !(newPhaseInt & 0x10000))
+        psg.noiseVal[ch] = (int32_t)((psg.noiseState >> 1) & 0x3F);
+      psg.phase[ch] = newPhase;
+
+      // 6-bit unsigned waveform value
+      int32_t v = 0;
+      switch (waveType) {
+      case 0: // pulse
+        v = ((newPhaseInt >> 10) > pw) ? 0 : 0x3F;
+        break;
+      case 1: // sawtooth (phase offset by the pulse-width field)
+        v = (int32_t)(newPhaseInt >> 11) ^ (int32_t)((pw ^ 0x3F) & 0x3F);
+        break;
+      case 2: // triangle
+        v = (int32_t)((newPhaseInt & 0x10000) ? (~(newPhaseInt >> 10) & 0x3F)
+                                             : ((newPhaseInt >> 10) & 0x3F)) ^
+            (int32_t)((pw ^ 0x3F) & 0x3F);
+        break;
+      default: // noise
+        v = psg.noiseVal[ch];
+        break;
       }
 
-      float volAmp = volumeLut[volIdx] / 511.0f;
-      float voiceSig = samp * volAmp;
+      // 6-bit unsigned -> sign-extended 6-bit, range -32..+31
+      int32_t sv = v ^ 0x20;
+      if (sv & 0x20)
+        sv |= 0xFFC0;
+      sv = (sv << 16) >> 16;
+
+      // Hardware voice level: every voice is attenuated by 3 bits, so one
+      // voice at full volume is ~1980/32767 and all 16 sum to just under full
+      // scale (VERAAudio.cpp: l += (sv * volume) >> 3).
+      const float voiceSig =
+          (float)sv * (float)volumeLut[volIdx] * (1.0f / 262144.0f);
 
       if (left)
         mixL += voiceSig;
@@ -272,9 +296,11 @@ static void render_frame(int16_t *outBuffer) {
     mixL *= effVol;
     mixR *= effVol;
 
-    // Soft analog-style tanh saturation with ample 8-voice headroom to avoid harsh clipping
-    float satL = tanhf(mixL / 8.0f);
-    float satR = tanhf(mixR / 8.0f);
+    // Soft analog-style tanh saturation. The PSG is now at hardware level
+    // (16 voices ~= full scale), so a 2.0x drive reproduces the previous
+    // output level while keeping the curve linear instead of slamming it.
+    float satL = tanhf(mixL * 2.0f);
+    float satR = tanhf(mixR * 2.0f);
 
     int32_t valL = (int32_t)(satL * 30000.0f);
     int32_t valR = (int32_t)(satR * 30000.0f);
@@ -384,6 +410,8 @@ int main(int argc, char **argv) {
                 strcmp(argv[i], "--timeout") == 0) &&
                i + 1 < argc) {
       timeoutSeconds = atof(argv[++i]);
+    } else if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
+      wavOutPath = argv[++i];
     } else if (argv[i][0] != '-') {
       filePath = argv[i];
     }
@@ -394,7 +422,7 @@ int main(int argc, char **argv) {
     printf(" VERA PSG Stream Player for Windows (psgplay v1.0)\n");
     printf("========================================================\n");
     printf("Usage:\n");
-    printf("  psgplay.exe <file.psg> [--no-loop] [--vol 0..15]\n\n");
+    printf("  psgplay.exe <file.psg> [--no-loop] [--vol 0..15] [--wav out.wav]\n\n");
     printf("Examples:\n");
     printf("  psgplay.exe TITLE.psg\n");
     printf("  psgplay.exe ..\\music\\BeatIt.psg\n\n");
@@ -428,6 +456,54 @@ int main(int argc, char **argv) {
 
   psg_reset();
   psg_seek(0);
+
+  // Offline render: write the whole stream to a 48 kHz stereo WAV using exactly
+  // the same DSP as live playback, then exit without touching waveOut. Matches
+  // melodius.exe --wav so PSG streams can be A/B'd against a reference render.
+  if (wavOutPath) {
+    FILE *w = fopen(wavOutPath, "wb");
+    if (!w) {
+      printf("Error: cannot open '%s' for writing\n", wavOutPath);
+      return 1;
+    }
+    // Canonical 44-byte WAV header: RIFF/WAVE + 16-byte fmt chunk
+    // (audioFormat, channels, sampleRate, byteRate, blockAlign, bitsPerSample)
+    // + data chunk.
+    const uint32_t dataBytes = (uint32_t)(totalFrames * SAMPLES_PER_FRAME * 4);
+    const uint16_t fmtSize = 16, audioFormat = WAVE_FORMAT_PCM;
+    const uint16_t chn = 2, bits = 16, blkAlign = 4;
+    const uint32_t rate = SAMPLE_RATE, byteRate = rate * blkAlign;
+    const uint32_t riffSize = 36 + dataBytes;
+    fwrite("RIFF", 1, 4, w);
+    fwrite(&riffSize, 4, 1, w);
+    fwrite("WAVE", 1, 4, w);
+    fwrite("fmt ", 1, 4, w);
+    fwrite(&fmtSize, 4, 1, w);
+    fwrite(&audioFormat, 2, 1, w);
+    fwrite(&chn, 2, 1, w);
+    fwrite(&rate, 4, 1, w);
+    fwrite(&byteRate, 4, 1, w);
+    fwrite(&blkAlign, 2, 1, w);
+    fwrite(&bits, 2, 1, w);
+    fwrite("data", 1, 4, w);
+    fwrite(&dataBytes, 4, 1, w);
+
+    int16_t *frameBuf = (int16_t *)malloc(SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
+    if (!frameBuf) {
+      printf("Error: out of memory\n");
+      fclose(w);
+      return 1;
+    }
+    for (int f = 0; f < totalFrames; f++) {
+      render_frame(frameBuf);
+      fwrite(frameBuf, 2, SAMPLES_PER_FRAME * 2, w);
+    }
+    free(frameBuf);
+    fclose(w);
+    printf("Wrote %s (%d frames, %.1fs)\n", wavOutPath, totalFrames,
+           totalFrames / (double)FPS);
+    return 0;
+  }
 
   // Initialize Win32 waveOut
   WAVEFORMATEX wfx;

@@ -8,6 +8,9 @@ setlocal
 ::   build.bat jukebox          -> same as above
 ::   build.bat quick            -> skip mod2psg, just re-assemble + pack
 ::   build.bat demo             -> regen demo.mod/psg only, then pack
+::   build.bat ftm <in.ftm> [songIdx] [out.psg]
+::                           -> convert a FamiStudio/FamiTone project to a VERA
+::                              PSG stream and validate it (no disk pack)
 :: ===========================================================================
 
 set TARGET=%1
@@ -23,9 +26,10 @@ if /i "%TARGET%"=="debris"       goto TSPACE
 if /i "%TARGET%"=="fantaisie"    goto TFANT
 if /i "%TARGET%"=="midi"         goto TFANT
 if /i "%TARGET%"=="beatit"       goto TBEAT
+if /i "%TARGET%"=="ftm"          goto TFTM
 if /i "%TARGET%"=="jukebox"      goto TJUKE
 
-echo [FAILED] Unknown target "%TARGET%". Valid: jukebox, quick, demo, fantaisie, beatit, space
+echo [FAILED] Unknown target "%TARGET%". Valid: jukebox, quick, demo, fantaisie, beatit, space, ftm
 goto FAIL
 
 :TDEMO
@@ -83,6 +87,48 @@ if exist music/space_debris.wav (
 )
 
 goto BDISK
+
+:TFTM
+rem ---------------------------------------------------------------------------
+rem FamiStudio/FamiTone -> VERA PSG. Every channel stem FamiStudio renders is
+rem converted (NES 2A03, VRC6, Sunsoft, ...); sample channels such as DPCM are
+rem reported because PSG registers cannot express them.
+rem ---------------------------------------------------------------------------
+rem Strip surrounding quotes from the arguments: a caller may include them, and
+rem leaving them in turns the empty-argument tests below into a syntax error.
+set FTM_SRC=%~2
+if "%FTM_SRC%"=="" set FTM_SRC=music/alterego-simpl0r.ftm
+set FTM_SONG=%~3
+if "%FTM_SONG%"=="" set FTM_SONG=0
+set FTM_OUT=%~4
+if "%FTM_OUT%"=="" set FTM_OUT=%FTM_SRC:.ftm=.psg
+
+if not exist "%FTM_SRC%" (
+  echo [FAILED] Input not found: "%FTM_SRC%"
+  goto FAIL
+)
+
+if "%FAMISTUDIO%"=="" set FAMISTUDIO=C:\dev\FamiStudio450\FamiStudio.exe
+
+echo [1/2] Convert "%FTM_SRC%" song %FTM_SONG% to "%FTM_OUT%" ...
+rem Forward the extra converter options. Note cmd splits "--opt=value" at the
+rem '=' when a batch file is invoked from PowerShell, so the converter also
+rem accepts the space-separated "--opt value" form.
+node tools/ftm2psg.mjs "%FTM_SRC%" %FTM_SONG% "%FTM_OUT%" %~5 %~6 %~7 %~8 %~9
+if errorlevel 1 goto FAIL
+
+echo [2/2] Validate "%FTM_OUT%" ...
+node tools/check_psg.mjs "%FTM_OUT%"
+if errorlevel 1 goto FAIL
+
+echo.
+echo ============================================================
+echo  FTM BUILD SUCCEEDED
+echo    %FTM_OUT%
+echo    Audition with:  tools\psgplay.exe "%FTM_OUT%"
+echo    (this target does not repack jukebox.po / jukebox.hdv)
+echo ============================================================
+goto END
 
 :TJUKE
 echo [1/7] Synthesise demo.mod ...
