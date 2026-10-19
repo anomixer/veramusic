@@ -23,8 +23,10 @@
 ;   IRQ consumes the published frame, applies PSG (VRAM $F9C0) + YM ($Cs21), and
 ;   clears FB_READY.
 ;
-; Controls (in song): ESC/Q = stop -> menu, P = pause, M = mute, +/- = vol.
-; Menu: digit 1-9,0 selects song; ESC/Q exits to BASIC (RTS).
+; Controls (in song): ESC/Q = stop -> menu, P/space = pause, M = mute,
+;   +/- = vol, ]/[ = forward/backward 5 s, R = restart, L = loop toggle.
+; Menu: digit 1-9,0 selects song; ESC/Q exits to BASIC (RTS). STARTUP can
+; preselect the song by POKEing 1..11 to $6800 (sentinel, read+cleared).
 ; AUTOPLAY = 1 (injected via --autoplay build) auto-starts song 0 for headless.
 ;
 ; Conventions: asm6502.mjs syntax, VERA_BASE injected ($C200 slot2/$C400 slot4),
@@ -92,6 +94,7 @@ FILE_BUF = $6000
 PCM_BUFFER = $4400   ; PCM sample staging buffer (7168 B) -- free RAM below FB_A
 PCM_BUFFER_SIZE = $1C00  ; 7168 bytes (PCM_BUFFER..PCM_BUFFER+SIZE-1)
 PCM_FILE_BUF = $6400 ; PCM refnum FCB (1024 B) -- free RAM below FILE_BUF+$400
+SEL_SENTINEL = $6800 ; STARTUP's POKE 26624,N (N=1..11 song preselect, cleared)
 
 AUTOPLAY = 0         ; release: menu only. --autoplay build injects AUTOPLAY=1.
 AUTOSONG = 0         ; which song index AUTOPLAY auto-starts (injectable).
@@ -142,10 +145,26 @@ MENU:
     JSR CLEAR_SCREEN
     JSR DRAW_MENU
     LDA #AUTOPLAY
-    BEQ MENU_WAIT_KEY
+    BEQ MENU_PRE
+    ; autoplay build: ignore the preselect sentinel, play AUTOSONG
     LDA #AUTOSONG
     STA SONG_NUM
     JMP PLAY_SONG
+MENU_PRE:
+    ; preselect sentinel at $6800 (STARTUP POKE 26624): 1..11 -> song
+    LDA $6800
+    BEQ MENU_WAIT_KEY
+    CMP #$0C
+    BCS MENU_PRE_BAD
+    SEC
+    SBC #$01
+    STA SONG_NUM
+    LDA #$00
+    STA $6800
+    JMP PLAY_SONG
+MENU_PRE_BAD:
+    LDA #$00
+    STA $6800
 MENU_WAIT_KEY:
     LDA KBD_DATA
     BPL MENU_WAIT_KEY
@@ -201,6 +220,16 @@ PLAY_SONG:
     STA DONE_FLAG
     STA FRAC
     STA HOLD_LEFT
+    STA MUTE
+    STA PAUSE
+    STA CLK_FRM
+    STA CLK_SEC
+    STA CLK_MIN
+    STA FRM0
+    STA FRM1
+    STA FRM2
+    LDA #$01
+    STA LOOP_EN
     ; Init the stream feeder so the first GETB refills into $4000.
     ; (STREAM_L/H and BUF_END are only set by REFILL; without this, the first
     ; GETB's exhaustion check compares garbage STREAM_H vs garbage BUF_END_H.)
@@ -213,10 +242,14 @@ PLAY_SONG:
     STA BUF_END_H
     JSR OPEN_STREAM
     LDA ERR
-    BNE PLAY_OPEN_FAIL
+    BEQ POF1_OK
+    JMP PLAY_OPEN_FAIL
+POF1_OK:
     JSR READ_HEADER
     LDA ERR
-    BNE PLAY_OPEN_FAIL
+    BEQ POF2_OK
+    JMP PLAY_OPEN_FAIL
+POF2_OK:
     JSR CLEAR_SHADOW
     ; Initialize write-buffer base to FB_A before the first decode.
     LDA #$00
@@ -263,6 +296,24 @@ MAIN:
     BEQ DO_VOL_DOWN_JMP
     CMP #$5F              ; _
     BEQ DO_VOL_DOWN_JMP
+    CMP #$5D              ; ] (forward 5 s)
+    BEQ DO_SEEK_FWD_JMP
+    CMP #$6B
+    BEQ DO_SEEK_FWD_JMP
+    CMP #$5B              ; [ (backward 5 s)
+    BEQ DO_SEEK_BWD_JMP
+    CMP #$63
+    BEQ DO_SEEK_BWD_JMP
+    CMP #$52              ; R restart
+    BEQ DO_RESTART_JMP
+    CMP #$72
+    BEQ DO_RESTART_JMP
+    CMP #$4C              ; L loop toggle
+    BEQ DO_LOOP_JMP
+    CMP #$6C
+    BEQ DO_LOOP_JMP
+    CMP #$A0              ; space
+    BEQ DO_PAUSE_JMP
     JMP MAIN
 SONG_DONE_JMP:
     JMP SONG_DONE
@@ -278,6 +329,14 @@ DO_VOL_UP_JMP:
     JMP DO_VOL_UP
 DO_VOL_DOWN_JMP:
     JMP DO_VOL_DOWN
+DO_SEEK_FWD_JMP:
+    JMP DO_SEEK_FWD
+DO_SEEK_BWD_JMP:
+    JMP DO_SEEK_BWD
+DO_RESTART_JMP:
+    JMP DO_RESTART
+DO_LOOP_JMP:
+    JMP DO_LOOP
 
 PLAY_OPEN_FAIL:
     JSR SHOW_STATUS
@@ -481,6 +540,8 @@ DF_EOD:
     ORA LOOP_OFF_M
     ORA LOOP_OFF_H
     BEQ DF_DONE           ; no loop -> song over
+    LDA LOOP_EN
+    BEQ DF_DONE           ; loop disabled -> song over
     JSR DO_LOOP_SEEK
     RTS
 DF_END:
@@ -756,28 +817,39 @@ PUB_SWAP_DONE:
 ; (zsmkit semantics). One-frame IRQ gap is natural (hardware sustains).
 ; --------------------------------------------------------------------------
 DO_LOOP_SEEK:
-    ; Wait for IRQ to finish the current published frame, then discard it.
     LDA #$11
     STA DEBUG_MARKER
-    LDA IRQ_ACTIVE
-    BEQ DLS_NOWAIT
-DLS_WAIT:
-    LDA FB_READY
-    BNE DLS_WAIT
-DLS_NOWAIT:
-    ; SET_MARK(loopOffset): 24-bit byte offset
-    LDA REF_NUM
-    STA SETMARK_PARAMS+1
     LDA LOOP_OFF_L
     STA SETMARK_PARAMS+2
     LDA LOOP_OFF_M
     STA SETMARK_PARAMS+3
     LDA LOOP_OFF_H
     STA SETMARK_PARAMS+4
+    JSR SEEK_TO
+    BCC DLS_OK
+    RTS                   ; ERR=1 -> MAIN reports DISK_FAIL
+DLS_OK:
+    LDA #$12
+    STA DEBUG_MARKER
+    RTS
+
+; SEEK_TO — SETMARK_PARAMS+2..4 already hold the 24-bit target byte offset.
+; Waits for FB_READY==0 (IRQ is idle), SET_MARKs the file cursor, refills.
+; Returns CLC on success; on failure SEC + ERR=1 + DEBUG_MARKER=$13 (MAIN
+; reports DISK_FAIL).  One-frame IRQ gap is natural (hardware sustains).
+SEEK_TO:
+    LDA IRQ_ACTIVE
+    BEQ ST_NOWAIT
+ST_WAIT:
+    LDA FB_READY
+    BNE ST_WAIT
+ST_NOWAIT:
+    LDA REF_NUM
+    STA SETMARK_PARAMS+1
     JSR MLI
     !byte $CE              ; SET_MARK
     !word SETMARK_PARAMS
-    BCC DLS_MARK_OK
+    BCC ST_MARK_OK
     STA ERRCODE
     LDA #$41
     STA ERRSRC
@@ -786,17 +858,349 @@ DLS_NOWAIT:
     STA ERR
     LDA #$13
     STA DEBUG_MARKER
+    SEC
     RTS
-DLS_MARK_OK:
-    LDA #$12
-    STA DEBUG_MARKER
+ST_MARK_OK:
     LDA #$00
     STA STREAM_END
     STA EOF_FLAG
     JSR REFILL
     LDA #$00
     STA STREAM_END
+    CLC
     RTS
+
+; --------------------------------------------------------------------------
+; In-song seek / restart / loop (psgplay-style button controls)
+; --------------------------------------------------------------------------
+
+; SEEK_STEP — decode one ZSM frame without publishing it.  PSG pairs update
+; SHADOW (gated by psgMask); YM pairs are discarded (every-frame rewrite:
+; the next frame's YM batch rewrites them all); PCM sub-events are skipped.
+; HOLD_LEFT frames are consumed like DECODE_FRAME does.  Returns CLC=frame
+; consumed, continue; SEC=stop (STREAM_END / EOD handled by the caller
+; policy).  Requires FB_READY==0 (main loop is idle: IRQ consumes nothing).
+; Clobbers A/X/Y + zp vars shared with the decode path.
+SEEK_STEP:
+    LDA HOLD_LEFT
+    BEQ SS_DECODE
+    DEC HOLD_LEFT
+    CLC
+    RTS
+SS_DECODE:
+    JSR GETB
+    STA CMD
+    LDA STREAM_END
+    BEQ SS_CMD
+    SEC
+    RTS
+SS_CMD:
+    LDA CMD
+    CMP #$40
+    BNE SS_D1
+    JMP SS_EXT
+SS_D1:
+    CMP #$80
+    BNE SS_D2
+    JMP SS_EOD
+SS_D2:
+    CMP #$41
+    BCC SS_PSG
+    JMP SS_YM
+SS_PSG:
+    JSR GETB
+    STA VAL_TMP
+    LDA STREAM_END
+    BEQ SS_PSG2
+    SEC
+    RTS
+SS_PSG2:
+    JSR PSG_MASK_GATE
+    BCC SS_PSG_SKIP
+    LDA VAL_TMP
+    LDX CMD
+    STA SHADOW,X
+SS_PSG_SKIP:
+    CLC
+    RTS
+SS_YM:
+    AND #$3F
+    STA CNT
+SS_YM_L:
+    JSR GETB              ; reg (discarded)
+    JSR GETB              ; val (discarded)
+    LDA STREAM_END
+    BEQ SS_YM2
+    SEC
+    RTS
+SS_YM2:
+    DEC CNT
+    BNE SS_YM_L
+    CLC
+    RTS
+SS_EXT:
+    JSR GETB
+    STA VAL_TMP
+    LDA STREAM_END
+    BEQ SS_EXT2
+    SEC
+    RTS
+SS_EXT2:
+    LDA VAL_TMP
+    CMP #$40
+    BCS SS_EXT_SYNC
+    ; ext < $40: skip 2*n PCM sub-event bytes (+ odd trailing byte).
+    LDA VAL_TMP
+    AND #$01
+    STA PCM_SUB           ; stash odd flag (PCM_SUB free during seek)
+    LDA VAL_TMP
+    LSR A
+    STA PCM_EVCOUNT
+    BEQ SS_EXT_ODD
+SS_EXT_L:
+    JSR GETB
+    LDA STREAM_END
+    BEQ SS_EXT_L2
+    SEC
+    RTS
+SS_EXT_L2:
+    JSR GETB
+    LDA STREAM_END
+    BEQ SS_EXT_L3
+    SEC
+    RTS
+SS_EXT_L3:
+    DEC PCM_EVCOUNT
+    BNE SS_EXT_L
+SS_EXT_ODD:
+    LDA PCM_SUB
+    BEQ SS_EXT_DONE
+    JSR GETB
+    LDA STREAM_END
+    BEQ SS_EXT_DONE2
+    SEC
+    RTS
+SS_EXT_DONE2:
+SS_EXT_DONE:
+    CLC
+    RTS
+SS_EXT_SYNC:
+    LDA VAL_TMP
+    AND #$3F
+    TAX
+    BEQ SS_EXT_DONE
+SS_SYNC_L:
+    JSR GETB
+    LDA STREAM_END
+    BEQ SS_SYNC2
+    SEC
+    RTS
+SS_SYNC2:
+    DEX
+    BNE SS_SYNC_L
+    CLC
+    RTS
+SS_EOD:
+    LDA LOOP_OFF_L
+    ORA LOOP_OFF_M
+    ORA LOOP_OFF_H
+    BEQ SS_EOD_DONE
+    LDA LOOP_EN
+    BEQ SS_EOD_DONE
+    JSR DO_LOOP_SEEK
+    SEC
+    RTS
+SS_EOD_DONE:
+    LDA #$01
+    STA DONE_FLAG
+    SEC
+    RTS
+
+; DO_SEEK_FWD — fast-forward 5 s (300 frames @ 60 Hz).  Decodes frames
+; through SEEK_STEP (SHADOW-only, no publish), then restores the PSG from
+; SHADOW.  On EOD+loop the file cursor ends up at loopOffset; on EOD with no
+; loop DONE_FLAG=1 (MAIN -> SONG_DONE).  Clock jumps +5 s.
+DO_SEEK_FWD:
+    LDA IRQ_ACTIVE
+    BEQ SF_NOWAIT
+SF_WAIT:
+    LDA FB_READY
+    BNE SF_WAIT
+SF_NOWAIT:
+    LDA #<300
+    STA SEEK_CNT_L
+    LDA #>300
+    STA SEEK_CNT_H
+SF_LOOP:
+    JSR SEEK_STEP
+    BCS SF_DONE
+    INC FRM0
+    BNE SF_F1
+    INC FRM1
+    BNE SF_F1
+    INC FRM2
+SF_F1:
+    LDA SEEK_CNT_L
+    SEC
+    SBC #$01
+    STA SEEK_CNT_L
+    LDA SEEK_CNT_H
+    SBC #$00
+    STA SEEK_CNT_H
+    LDA SEEK_CNT_L
+    ORA SEEK_CNT_H
+    BNE SF_LOOP
+SF_DONE:
+    ; clock += 5 s
+    CLC
+    LDA CLK_SEC
+    ADC #5
+    STA SEEK_TMP
+    CMP #60
+    BCC SF_CLK_OK
+    SEC
+    SBC #60
+    INC CLK_MIN
+    STA SEEK_TMP
+SF_CLK_OK:
+    LDA SEEK_TMP
+    STA CLK_SEC
+    SEI
+    JSR RESTORE_ALL
+    CLI
+    JMP MAIN
+
+; DO_SEEK_BWD — rewind 5 s (up to 300 frames, clamped at song start).
+; SET_MARK(0) the file cursor, clear SHADOW, fast-scan TARG frames, clock
+; -= 5 s (with borrow).  FRM0/1/2 restart from 0 and end at TARG.
+DO_SEEK_BWD:
+    LDA IRQ_ACTIVE
+    BEQ SB_NOWAIT
+SB_WAIT:
+    LDA FB_READY
+    BNE SB_WAIT
+SB_NOWAIT:
+    SEC
+    LDA FRM0
+    SBC #<300
+    STA TARG_L
+    LDA FRM1
+    SBC #>300
+    STA TARG_H
+    BCS SB_TARG_OK
+    LDA #$00
+    STA TARG_L
+    STA TARG_H
+SB_TARG_OK:
+    LDA #$00
+    STA SETMARK_PARAMS+2
+    STA SETMARK_PARAMS+3
+    STA SETMARK_PARAMS+4
+    JSR SEEK_TO
+    BCS SB_FAIL
+    JSR CLEAR_SHADOW
+    LDA #$00
+    STA FRM0
+    STA FRM1
+    STA FRM2
+    LDA TARG_L
+    ORA TARG_H
+    BNE SB_SCAN
+    ; TARG = 0: song restart — silence + zero the clock
+    JSR SILENCE_ALL
+    LDA #$00
+    STA CLK_FRM
+    STA CLK_SEC
+    STA CLK_MIN
+SB_SCAN:
+SB_SCAN_LOOP:
+    JSR SEEK_STEP
+    BCS SB_DONE
+    INC FRM0
+    BNE SB_F1
+    INC FRM1
+    BNE SB_F1
+    INC FRM2
+SB_F1:
+    LDA TARG_L
+    SEC
+    SBC #$01
+    STA TARG_L
+    LDA TARG_H
+    SBC #$00
+    STA TARG_H
+    LDA TARG_L
+    ORA TARG_H
+    BNE SB_SCAN_LOOP
+SB_DONE:
+    ; clock -= 5 s (borrow from minutes; wrap at zero ignored)
+    SEC
+    LDA CLK_SEC
+    SBC #5
+    STA CLK_SEC
+    BCS SB_CLK_OK
+    LDA CLK_SEC
+    CLC
+    ADC #60
+    STA CLK_SEC
+    LDA CLK_MIN
+    BEQ SB_CLK_OK
+    DEC CLK_MIN
+SB_CLK_OK:
+    SEI
+    JSR RESTORE_ALL
+    CLI
+    JMP MAIN
+SB_FAIL:
+    SEI
+    JSR RESTORE_ALL
+    CLI
+    JMP MAIN
+
+; DO_RESTART — restart the current song from frame 0: rewind the file
+; cursor, reset engine state + clock, re-arm the loop, unpause.
+DO_RESTART:
+    LDA IRQ_ACTIVE
+    BEQ RS_NOWAIT
+RS_WAIT:
+    LDA FB_READY
+    BNE RS_WAIT
+RS_NOWAIT:
+    LDA #$00
+    STA SETMARK_PARAMS+2
+    STA SETMARK_PARAMS+3
+    STA SETMARK_PARAMS+4
+    JSR SEEK_TO
+    BCS RS_EXIT
+    JSR CLEAR_SHADOW
+    LDA #$00
+    STA FRM0
+    STA FRM1
+    STA FRM2
+    STA CLK_FRM
+    STA CLK_SEC
+    STA CLK_MIN
+    STA FRAC
+    STA HOLD_LEFT
+    STA DONE_FLAG
+    STA ERR
+    STA STREAM_END
+    STA EOF_FLAG
+    STA PAUSE
+    LDA #$01
+    STA LOOP_EN
+RS_EXIT:
+    SEI
+    JSR RESTORE_ALL
+    CLI
+    JMP MAIN
+
+; DO_LOOP — toggle in-song loop (EOD follows it when LOOP_EN=1).
+DO_LOOP:
+    LDA LOOP_EN
+    EOR #$01
+    STA LOOP_EN
+    JMP MAIN
 
 ; --------------------------------------------------------------------------
 ; PCM support (full ZSM: PSG + FM + PCM). PCM samples are staged in
@@ -2217,12 +2621,23 @@ DM_TITLE_DONE:
     LDY #$00
 DM_CTRL:
     LDA MENU_CTRL,Y
-    BEQ DM_DONE
+    BEQ DM_CTRL2
     ORA #$80
     STA $0638,Y
     INY
     CPY #40
     BNE DM_CTRL
+    ; second control line at $0660 (row 13)
+DM_CTRL2:
+    LDY #$00
+DM_CTRL2_L:
+    LDA MENU_CTRL2,Y
+    BEQ DM_DONE
+    ORA #$80
+    STA $0660,Y
+    INY
+    CPY #40
+    BNE DM_CTRL2_L
 DM_DONE:
     RTS
 
@@ -2397,7 +2812,10 @@ MENU_TITLE:
     ASC "ZSM JUKEBOX R1 FOR APPLE II          "
     !byte 0
 MENU_CTRL:
-    ASC "ESC/Q=EXIT  1-9,0=SELECT  P=PAUSE M=MUTE"
+    ASC "ESC/Q=EXIT  1-9,0=S  P=PAUSE  M=MUTE"
+    !byte 0
+MENU_CTRL2:
+    ASC "+/-:VOL  R=RESTART  L=LOOP  [/]:SEEK"
     !byte 0
 ERRMSG:
     ASC "DISK ERR - STREAM BLOCK UNREADABLE"
@@ -2663,4 +3081,17 @@ PCM_FP_ADDR_L:
 PCM_FP_ADDR_H:
     !byte 0
 ERRSRC:
+    !byte 0
+; --- seek / restart / loop state ---
+LOOP_EN:
+    !byte 1
+SEEK_CNT_L:
+    !byte 0
+SEEK_CNT_H:
+    !byte 0
+TARG_L:
+    !byte 0
+TARG_H:
+    !byte 0
+SEEK_TMP:
     !byte 0
