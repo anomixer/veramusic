@@ -8,7 +8,8 @@
  *   - ZSMSTREAM.BIN / ZSMSTREAM4.BIN  (player, $2000 BRUN, slot 2/4)
  *   - STARTUP                          (Applesoft slot probe → BRUN)
  *   - 10 ZSM songs (type $00, read by the player via MLI by name)
- * `--autoplay` uses ZSMSTREAMA.BIN (AUTOPLAY=1) as ZSMSTREAM.BIN for headless.
+ * `--autoplay` uses zsmstream_autostart.bas (direct BRUN, no menu) as STARTUP
+ * and ZSMSTREAMA.BIN (AUTOPLAY=1) as ZSMSTREAM.BIN for headless.
  *
  * Mirrors build_jukebox.mjs: template HDV, Cadius ADDFILE/CHECKVOLUME/CATALOG.
  */
@@ -72,7 +73,10 @@ const asm = (slot, extraLines = []) => {
 const player2 = asm(2, AUTOPLAY ? [`AUTOPLAY = 1`, `AUTOSONG = ${autoSong}`] : []);
 const player4 = asm(4, []);
 
-const startupCode = compileApplesoftBasic(srcDir, "zsmstream_startup.bas");
+const startupCode = compileApplesoftBasic(
+  srcDir,
+  AUTOPLAY ? "zsmstream_autostart.bas" : "zsmstream_startup.bas",
+);
 
 // ---- Cadius ---------------------------------------------------------------
 const cadius = process.env.CADIUS || path.join(rootDir, "tools", "cadius.exe");
