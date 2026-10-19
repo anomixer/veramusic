@@ -48,6 +48,9 @@ Tested on:
   - A 65C02 program that writes YM2151 FM events through the VERA card's FM daughterboard registers (`VERA_BASE + $20` register select, `VERA_BASE + $21` data/status), the Apple-side equivalent of the X16's `$9F40`/`$9F41`.
   - Bootable 140KB ProDOS floppy (`zsmplay.po`) with an auto-starting Applesoft `STARTUP` that probes for a slot-2 or slot-4 VERA card before `BRUN`-ing the player.
   - Dual-slot binaries: `src/ZSMPLAY.BIN` (slot 2) and `src/ZSMPLAY4.BIN` (slot 4), both loaded at `$2000`; exits via `RTS` so control returns cleanly to BASIC.
+- **Apple //e ZSM Stream Player (`src/zsmstream.asm` → `zsmstream.hdv`)**:
+  - A real 6502 ZSM player: streams `.ZSM` files from ProDOS disk (decode-ahead in the main loop, never in the IRQ), plays VERA PSG + YM2151 FM (PCM deferred), `BRUN`s at `$2000`, with a built-in menu of 11 songs on a 32 MB hard disk (`zsmstream.hdv`).
+  - Dual-slot binaries (`src/ZSMSTREAM.BIN` slot 2, `src/ZSMSTREAM4.BIN` slot 4) + a `ZSMSTREAMA.BIN` AUTOPLAY variant for headless verification.
 - **Universal Player Controls Across All Formats**:
   - `ESC` / `Q`: Clean exit.
   - `P` / `SPACE`: Real-time pause / unpause.
@@ -88,6 +91,8 @@ veramusic/
 ├── jukebox.hdv.zip            # Compressed 32MB hard disk image (~2.7MB, auto-generated)
 ├── jukebox.po                 # Pre-built bootable 140KB ProDOS floppy disk image
 ├── zsmplay.po                 # Pre-built bootable 140KB ProDOS floppy (Apple //e ZSM/FM player)
+├── zsmstream.hdv              # Pre-built bootable 32MB ProDOS hard disk (Apple //e ZSM player: PSG + FM)
+├── zsmstream.hdv.zip          # Compressed 32MB ZSM player image (~2.7MB, auto-generated)
 ├── ymfm/                      # Bundled ymfm YM2151 core (self-contained for tools/melodius.exe)
 │   ├── ymfm.h                 # ymfm core base
 │   ├── ymfm_fm.h              # FM engine declarations
@@ -107,6 +112,11 @@ veramusic/
 │   ├── ZSMPLAY.BIN            # Built player binary, slot 2 ($2000 BRUN)
 │   ├── ZSMPLAY4.BIN           # Built player binary, slot 4 ($2000 BRUN)
 │   ├── zsmplay_startup.bas    # Applesoft BASIC VERA slot probe → BRUN ZSMPLAY.BIN
+│   ├── zsmstream.asm          # Apple //e ZSM stream player (PSG + YM2151 FM, 11-song menu)
+│   ├── ZSMSTREAM.BIN          # Built ZSM player binary, slot 2 ($2000 BRUN)
+│   ├── ZSMSTREAM4.BIN         # Built ZSM player binary, slot 4 ($2000 BRUN)
+│   ├── ZSMSTREAMA.BIN         # Built ZSM player binary, slot 2, AUTOPLAY=1 (headless verify)
+│   ├── zsmstream_startup.bas  # Applesoft BASIC VERA slot probe → BRUN ZSMSTREAM.BIN
 │   ├── vera.inc               # VERA hardware register equates
 │   ├── startup.bas            # Applesoft BASIC auto-boot menu (HDV)
 │   └── startup_po.bas         # Applesoft BASIC auto-boot menu (PO)

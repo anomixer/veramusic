@@ -28,8 +28,9 @@ if /i "%TARGET%"=="midi"         goto TFANT
 if /i "%TARGET%"=="beatit"       goto TBEAT
 if /i "%TARGET%"=="ftm"          goto TFTM
 if /i "%TARGET%"=="jukebox"      goto TJUKE
+if /i "%TARGET%"=="zsmstream"    goto TZSM
 
-echo [FAILED] Unknown target "%TARGET%". Valid: jukebox, quick, demo, fantaisie, beatit, space, ftm
+echo [FAILED] Unknown target "%TARGET%". Valid: jukebox, quick, demo, fantaisie, beatit, space, ftm, zsmstream
 goto FAIL
 
 :TDEMO
@@ -188,6 +189,26 @@ if exist music/BeatIt.psg (
   node tools/check_psg.mjs music/BeatIt.psg
   if errorlevel 1 goto FAIL
 )
+
+:TZSM
+echo [1/2] Assemble zsmstream player (slot 2 + slot 4) ...
+node tools/build_zsmstream.mjs
+if errorlevel 1 goto FAIL
+
+echo [2/2] Build zsmstream.hdv (32MB, ZSMSTREAM volume) ...
+node tools/build_zsmstream_hdv.mjs
+if errorlevel 1 goto FAIL
+
+echo.
+echo ============================================================
+echo  ZSMSTREAM BUILD SUCCEEDED
+echo    src\ZSMSTREAM.BIN  -- slot 2 player ($2000 BRUN)
+echo    src\ZSMSTREAM4.BIN -- slot 4 player
+echo    zsmstream.hdv     -- 32MB HDV (and .zip): 11 ZSM songs
+echo    Controls          -- digit=select, ESC/Q=exit, P=pause,
+echo                           +,-=VOL, M=mute
+echo ============================================================
+goto END
 
 :BDISK
 echo.
