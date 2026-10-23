@@ -37,20 +37,25 @@ Tested on:
   - Requires only Windows; it does not invoke FamiStudio, Node.js, FamiTone, or `psgplay.exe`. DPCM sample playback and expansion chips are not supported.
 - **Melodius for Windows (`tools/melodius.exe`)**:
   - A Windows port of [Melodius](https://github.com/mooinglemur/melodius), the Commander X16 music player that runs **ZSM** and **ZCM** through the X16 audio API (zsmkit).
-  - Renders the same engine the X16 uses — YM2151 (OPM) FM via ymfm, the 16-channel VERA PSG and the VERA PCM FIFO — summed 1:1 and hardware-accurately scaled, so the Commander X16 mix balance is preserved.
+  - Renders the same engine the X16 uses — YM2151 (OPM) FM via ymfm, the 16-channel VERA PSG and the VERA PCM FIFO — with the X16 Developer Board bus balance **`(PSG + PCM) × 2 + YM`** and a linear, hard-clipping output stage, so the Commander X16 mix balance is preserved.
   - 48,000 Hz 16-bit stereo with authentic L/R panning (YM2151 pan registers `$20`–`$27` + VERA PSG stereo control bits).
   - **ZSM** (`.zsm`/`.zm`): full container support — loop points, per-chip channel masks, non-60 Hz tick rates, EXTCMD PCM streams and the 8-byte PCM instrument table (mono/stereo, 8/16-bit).
   - **ZCM** (`.zcm`): ZSound PCM container — `00 00 00` signature, 24-bit sample length, geometry byte and `AudioRate` byte, then raw PCM. PCM-only, so it uses just the VERA PCM FIFO.
   - **Standard MIDI Files (`.mid`/`.midi`) are not supported by this build** — they are rejected with an explicit message. Melodius's MIDI engine has not been ported.
-  - Adjustable engine gains (`--fmvol`/`F1`/`F2`, `--psgvol`/`F3`/`F4`, `--pcmvol`/`F5`/`F6`), default **1.0×** = hardware level.
+  - Adjustable engine gains (`--fmvol`/`F1`/`F2`, `--psgvol`/`F3`/`F4`, `--pcmvol`/`F5`/`F6`); defaults **FM 1.0×, PSG 2.0×, PCM 2.0×** = the board's `(PSG + PCM) * 2 + YM` mix.
+  - ZSM `key-off` + `key-on` retriggers inside one tick are honoured (one native YM sample is clocked after a key-off, matching x16emu), so every FM note re-attacks instead of only the first.
   - `--wav out.wav` renders the whole track offline to a 48 kHz stereo WAV and exits, for A/B comparison against a reference render.
-- **Apple //e ZSM Player (`src/zsmplay.asm` → `zsmplay.po`)**:
-  - A 65C02 program that writes YM2151 FM events through the VERA card's FM daughterboard registers (`VERA_BASE + $20` register select, `VERA_BASE + $21` data/status), the Apple-side equivalent of the X16's `$9F40`/`$9F41`.
-  - Bootable 140KB ProDOS floppy (`zsmplay.po`) with an auto-starting Applesoft `STARTUP` that probes for a slot-2 or slot-4 VERA card before `BRUN`-ing the player.
-  - Dual-slot binaries: `src/ZSMPLAY.BIN` (slot 2) and `src/ZSMPLAY4.BIN` (slot 4), both loaded at `$2000`; exits via `RTS` so control returns cleanly to BASIC.
-- **Apple //e ZSM Stream Player (`src/zsmstream.asm` → `zsmstream.hdv`)**:
-  - A real 6502 ZSM player: streams `.ZSM` files from ProDOS disk (decode-ahead in the main loop, never in the IRQ), plays VERA PSG + YM2151 FM (PCM deferred), `BRUN`s at `$2000`, with a built-in menu of 11 songs on a 32 MB hard disk (`zsmstream.hdv`).
-  - Dual-slot binaries (`src/ZSMSTREAM.BIN` slot 2, `src/ZSMSTREAM4.BIN` slot 4) + a `ZSMSTREAMA.BIN` AUTOPLAY variant for headless verification.
+- **Apple //e FM Test Player (`src/zsmplay.asm`, legacy)**:
+  - A 120-line 65C02 program that plays an **embedded** ZSM event stream through the VERA card's FM daughterboard registers (`VERA_BASE + $20` register select, `VERA_BASE + $21` data/status), the Apple-side equivalent of the X16's `$9F40`/`$9F41`. It was the bring-up test for that interface and has been superseded by the streaming jukebox below.
+  - No disk image is committed: `node tools/build_zsmplay_po.mjs` packs `zsmplay.po` (140 KB ProDOS floppy, auto-starting Applesoft `STARTUP` that probes slot 2 / slot 4 VERA then `BRUN`s the player) locally from `src/ZSMPLAY.BIN` (slot 2) and `src/ZSMPLAY4.BIN` (slot 4), both loaded at `$2000`; it exits via `RTS` so control returns cleanly to BASIC.
+- **Apple //e ZSM Jukebox (`src/zsmstream.asm` → `melodius.hdv`)**:
+  - A real 6502 ZSM player: streams `.ZSM` files from ProDOS disk (decode-ahead in the main loop, never in the IRQ) and plays all three VERA engines — PSG, YM2151 FM and the PCM FIFO — then `BRUN`s at `$2000`.
+  - **Tick-rate normalization** follows zsmkit: the decoder folds `tickRate/60` stream ticks (plus a carried remainder) into each 60 Hz output frame, so non-60 Hz files play at tempo — Headbanger at 240 ticks/s used to run 4× slow — and rates below 60 publish hold frames. The frame counter tracks source ticks, so the 5 s seek keys scale with the file's tick rate.
+  - Two-level jukebox menu (17 composer/furniture categories → songs) over **94 ZSM tracks** on a 32 MB hard disk (`melodius.hdv`), mirroring the layout of `jukebox.hdv`.
+  - In-song header in the jukebox style: brand + category on row 0, the title with its `(m:ss)` length right-aligned on row 1, a 40-column dash rule, then two control lines with a live `L=LOOP: ON/OFF` tag; the status line (time / seek bar / volume) stays on row 23. Durations are **ticks ÷ the header tick rate** (11 of the 94 files are not 60 Hz: Headbanger 4:24 rather than 17:34, BlankPage 9:09 rather than the 9:46 `melodius.exe` used to print).
+  - PCM samples are streamed from a companion `<name>.PCM` file (ProDOS 8 refuses a second OPEN on an already-open file, so the build step splits the ZSM's PCM table out) in 2 KB windows refilled from disk while the sample plays, so instruments of any size work.
+  - PCM samples are **decimated at build time** by `tools/zsm_pcm_resample.mjs` to the jukebox's proven 8 kHz (**VERA rate 21**), with 16-bit instruments re-quantized to dithered 8-bit: every rate event is scaled and the sample data area-decimated by the inverse, so pitch and duration are preserved. Mono songs cost **8,011 B/s** of FIFO, the five stereo ones 16,022 B/s, and all 28 PCM songs play glitch-free on a 1.02 MHz //e. Companions shrink accordingly (`PCM01.PCM` 1.47 MB → 423 KB, `MOO03.PCM` 6.8 KB).
+  - Dual-slot binaries (`src/MELODIUS.BIN` slot 2, `src/MELODIUS4.BIN` slot 4); `node tools/build_melodius.mjs --autoplay <idx>` produces a temp auto-play image for headless verification, `--list` prints the song index table.
 - **Universal Player Controls Across All Formats**:
   - `ESC` / `Q`: Clean exit.
   - `P` / `SPACE`: Real-time pause / unpause.
@@ -80,6 +85,17 @@ Tested on:
 | **1** | **Melody Demo** | RAM PSG | 0:30 | Host RAM player |
 | **2** | **Chopin: Fantaisie-Impromptu** | VERA RAM PSG | 5:02 | VERA 128KB SRAM pre-loaded (zero floppy noise/lag) |
 
+### 3. Apple //e ZSM Jukebox (`melodius.hdv`)
+94 Commander X16 `.ZSM` tracks in 17 categories (11 Furnace artists, 5 game
+soundtracks and the `PCM: TREE` slot), played by `src/zsmstream.asm` on real
+6502 hardware or in AppleWin with the VERA card in slot 2 or 4. Durations are
+`ticks ÷ header tick rate`; PCM instruments ship as companion `<name>.PCM`
+files decimated to 8 kHz. Boot it with:
+
+```cmd
+AppleWin.exe -s2 vera -s7 hdc -h1 melodius.hdv -power-on
+```
+
 ---
 
 ## Repository Structure
@@ -90,9 +106,8 @@ veramusic/
 ├── jukebox.hdv                # Pre-built bootable 32MB ProDOS hard disk image
 ├── jukebox.hdv.zip            # Compressed 32MB hard disk image (~2.7MB, auto-generated)
 ├── jukebox.po                 # Pre-built bootable 140KB ProDOS floppy disk image
-├── zsmplay.po                 # Pre-built bootable 140KB ProDOS floppy (Apple //e ZSM/FM player)
-├── zsmstream.hdv              # Pre-built bootable 32MB ProDOS hard disk (Apple //e ZSM player: PSG + FM)
-├── zsmstream.hdv.zip          # Compressed 32MB ZSM player image (~2.7MB, auto-generated)
+├── melodius.hdv               # Pre-built bootable 32MB ProDOS hard disk (Apple //e jukebox: PSG + FM + PCM, 94 songs)
+├── melodius.hdv.zip           # Compressed 32MB jukebox image (~3.6MB, auto-generated)
 ├── ymfm/                      # Bundled ymfm YM2151 core (self-contained for tools/melodius.exe)
 │   ├── ymfm.h                 # ymfm core base
 │   ├── ymfm_fm.h              # FM engine declarations
@@ -108,15 +123,13 @@ veramusic/
 │   ├── pcmstream.asm          # ProDOS MLI OPEN/READ stream player (PCM)
 │   ├── pcmplay.asm            # Host RAM-resident PCM player
 │   ├── hybridstream.asm       # Legacy hybrid player (not packaged by current builder)
-│   ├── zsmplay.asm            # Apple //e ZSM player (VERA FM daughterboard, slot 2/4)
+│   ├── zsmplay.asm            # Legacy FM bring-up player (embedded stream, VERA FM slot 2/4)
 │   ├── ZSMPLAY.BIN            # Built player binary, slot 2 ($2000 BRUN)
 │   ├── ZSMPLAY4.BIN           # Built player binary, slot 4 ($2000 BRUN)
 │   ├── zsmplay_startup.bas    # Applesoft BASIC VERA slot probe → BRUN ZSMPLAY.BIN
-│   ├── zsmstream.asm          # Apple //e ZSM stream player (PSG + YM2151 FM, 11-song menu)
-│   ├── ZSMSTREAM.BIN          # Built ZSM player binary, slot 2 ($2000 BRUN)
-│   ├── ZSMSTREAM4.BIN         # Built ZSM player binary, slot 4 ($2000 BRUN)
-│   ├── ZSMSTREAMA.BIN         # Built ZSM player binary, slot 2, AUTOPLAY=1 (headless verify)
-│   ├── zsmstream_startup.bas  # Applesoft BASIC VERA slot probe → BRUN ZSMSTREAM.BIN
+│   ├── zsmstream.asm          # Apple //e ZSM jukebox engine (PSG + YM2151 FM + streamed PCM)
+│   ├── MELODIUS.BIN           # Built jukebox binary, slot 2 ($2000 BRUN)
+│   ├── MELODIUS4.BIN          # Built jukebox binary, slot 4 ($2000 BRUN)
 │   ├── vera.inc               # VERA hardware register equates
 │   ├── startup.bas            # Applesoft BASIC auto-boot menu (HDV)
 │   └── startup_po.bas         # Applesoft BASIC auto-boot menu (PO)
@@ -131,7 +144,7 @@ veramusic/
 │   ├── melodius.exe            # Native Windows x86 Commander X16 ZSM/ZCM player
 │   ├── melodius.cpp            # Source code for melodius (ymfm YM2151 + VERA PSG + VERA PCM + WinMM)
 │   ├── build_melodius.bat      # MSVC build script for melodius.exe
-│   ├── build_zsmplay_po.mjs   # Packs zsmplay.po (ZSMPLAY.BIN + STARTUP) from the ProDOS template
+│   ├── build_zsmplay_po.mjs   # Packs zsmplay.po locally (ZSMPLAY.BIN + STARTUP); the image is not committed
 │   ├── zsm_scan.mjs           # ZSM analyzer (event histogram + header/PCM table dump)
 │   ├── zsm_pan.mjs            # ZSM stereo panning usage analyzer
 │   ├── zsm2psg.mjs            # Commander X16 ZSM → 60 Hz PSG stream converter
@@ -139,6 +152,8 @@ veramusic/
 │   ├── mod2psg.mjs            # ProTracker MOD (.mod) → 60 Hz PSG stream converter
 │   ├── wav2pcm.mjs            # Audio (.wav/.mp3) → 8010 Hz VERA PCM converter
 │   ├── build_jukebox.mjs      # ProDOS volume packager & automatic ZIP generator
+│   ├── build_melodius.mjs     # Apple //e jukebox: assembles zsmstream.asm, splits PCM companions, packs melodius.hdv
+│   ├── zsm_pcm_resample.mjs   # ZSM PCM instrument resampler (decimates high-rate samples to the jukebox rate)
 │   └── check_psg.mjs          # 6502 cycle & register write validator
 ├── music/                     # Source projects and converted streams (.ftm, .mid, .mod, .psg, .pcm)
 │   ├── alterego-simpl0r.ftm  # Bundled 2A03 reference module (10 songs)
@@ -176,6 +191,9 @@ build.bat quick
 
 # Full rebuild: reconvert all MIDI/MOD/PCM sources and pack images
 build.bat jukebox
+
+# Assemble src/zsmstream.asm and pack the Apple //e ZSM jukebox (melodius.hdv + .zip)
+build.bat melodius
 ```
 
 ### Manual Audio Conversions
@@ -251,13 +269,13 @@ melodius.exe ..\music\CANYON.ZSM
 # Play a ZCM (PCM-only container)
 melodius.exe ..\assets\shoryukEN_8kmono8bit.zcm --no-loop
 
-# Boost the FM (YM2151) mix — drums & percussion live here (default gain 1.0 = hardware level)
+# Boost the FM (YM2151) mix — drums & percussion live here (default FM gain 1.0 = hardware level)
 melodius.exe CANYON.ZSM --fmvol 4.0
 
 # One-shot playback (do not loop)
 melodius.exe TITLE.ZSM --no-loop
 
-# Set initial master volume (0..15, default 12)
+# Set initial master volume (0..15, default 15)
 melodius.exe HIGHSCORE.ZSM --vol 12
 
 # Render offline to a WAV instead of playing
@@ -281,14 +299,17 @@ melodius.exe TREE.ZSM
 
 **Real-Time Status Bar**:
 ```text
-[TITLE.ZSM   ] 00:00/00:55 [>               ] [.......^..........] V:12 FM:1.00 PSG:1.00 PCM:1.00 [LOOP]
+00:00/00:55 [===============>] [FM ........] [PSG ======#....] [PCM --] V:15 FM:1.00 PSG:2.00 PCM:2.00 [LOOP]
 ```
-- **`T: mm:ss`**: Elapsed / total playback time.
-- **`[...]`**: 18-character activity meter. For FM+PSG tracks (ZSM `fmMask` ≠ 0): slots 0-7 = YM2151 FM channels 0-7 (`^` = key-on, `.` = off), slots 8-15 = VERA PSG voices 0-7 (symbol guide below), slots 16-17 = VERA PCM L/R output level. For pure-PSG tracks: slots 0-15 = PSG voices 0-15, slots 16-17 = PCM L/R.
-- **`V:xx`**: Master volume level (0 to 15, defaults to **12**; `+`/`-` adjust, `--vol N` sets it at startup).
+- **`mm:ss/mm:ss`**: Elapsed / total playback time.
+- **`[...]`** (first bracket): 16-character progress bar for the whole track.
+- **`[FM ...]`**: YM2151 FM channel meter, 8 characters (`^` = key-on, `.` = off).
+- **`[PSG ...]`**: 16-character VERA PSG activity meter, one slot per voice (`.`, `-`, `=`, `#`, `^` by volume; symbol guide below).
+- **`[PCM ...]`**: VERA PCM output level, left then right (0..32767, sampled before the PCM gain). `.` = silent, `-` = 1..8191, `=` = 8192..16383, `#` = 16384..24575, `^` = 24576..32767.
+- **`V:xx`**: Master volume level (0 to 15, defaults to **15**; `+`/`-` adjust, `--vol N` sets it at startup).
 - **`FM:x.xx`**: Current YM2151 FM mix gain (adjustable live with `F1`/`F2`, default 1.00 = hardware level).
-- **`PSG:x.xx`**: Current VERA PSG mix gain (adjustable live with `F3`/`F4`, default 1.00 = hardware level).
-- **`PCM:x.xx`**: Current VERA PCM mix gain (adjustable live with `F5`/`F6`, default 1.00 = hardware level).
+- **`PSG:x.xx`**: Current VERA PSG mix gain (adjustable live with `F3`/`F4`, default 2.00 = the X16 mixer's VERA bus ×2).
+- **`PCM:x.xx`**: Current VERA PCM mix gain (adjustable live with `F5`/`F6`, default 2.00 = the X16 mixer's VERA bus ×2).
 - **`[LOOP]`**: Loop / repeat (`REPT`) / one-shot (`1SHT`) / paused (`PAUS`) / muted (`MUTE`) state. Tracks with no loop point play once and exit automatically.
 
 **Stereo**: Both engines output true stereo — YM2151 per-channel panning (registers `$20`–`$27`: bit 6 = left, bit 7 = right) and VERA PSG per-voice stereo control bits. Tracks like `TITLE.ZSM` and `KILLED.ZSM` pan voices across the stereo field.
@@ -320,17 +341,6 @@ Each character reflects the instantaneous volume register (bits 5:0, 0..63) of t
 | `#` | 35 .. 49 | **Loud** | Main melody lead, prominent brass, accented notes |
 | `^` | 50 .. 63 | **Peak** | Fortissimo climax, high choir lead, drum transient spike |
 
-##### PCM Level Symbol Guide (slots 16-17)
-The last two meter slots show the VERA PCM left/right output peak (0..32767, sampled before the PCM gain so the meter reflects the sample content):
-
-| Symbol | Level Range (0..32767) | Description |
-| :---: | :---: | :--- |
-| `.` | 0 | PCM silent / not active |
-| `-` | 1 .. 8191 | Quiet passage |
-| `=` | 8192 .. 16383 | Medium level |
-| `#` | 16384 .. 24575 | Loud passage |
-| `^` | 24576 .. 32767 | Peak / near-full-scale |
-
 #### 2. PCM Stream Tracks (Tracks 5 & 6: Space Debris, The Wellerman)
 Pure 8-bit PCM audio streams from ProDOS files into VERA's 4 KB hardware FIFO without using PSG voices. Instead of channel meters, it displays the logical 512-byte file-chunk count:
 
@@ -358,6 +368,9 @@ T: mm:ss.c B:xxxx V:15
 - **YM2151 FM (AppleWin VERA fork only)**:
   - Register select at slot base + `$20`, data at slot base + `$21` (e.g. `$C220` / `$C221` on Slot 2).
   - Not present on physical VERA cards — emulated by the AppleWin fork with the ymfm core; `tools/melodius.exe` renders the identical mix natively on Windows.
+- **Mix Balance**:
+  - The X16 Developer Board sums the engines as `(PSG + PCM) * 2 + YM`. A single full-volume PSG voice is 1/8 of full scale, so the ×2 on the VERA bus is required for the PSG to sit correctly against the YM2151; `melodius.exe` reproduces that balance with a linear sum and a hard clip at full scale.
+  - `tools/melodius.exe` implements this balance (FM 1.0×, PSG/PCM 2.0×, linear output). AppleWin's `VERACard::UpdateSound` still uses a 1:1 `PSG + YM` sum and is the remaining follow-up.
 
 ---
 

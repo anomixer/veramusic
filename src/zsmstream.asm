@@ -16,6 +16,13 @@
 ; Decoder runs in the main loop (never in IRQ): MLI is not re-entrant, so all
 ; disk I/O and decoding happen here. The IRQ only reads the published frame.
 ;
+; Tick-rate normalization follows zsmkit: ZSM ticks are consumed at
+; TICKRATE/60 per 60 Hz output frame (remainder carried in FRAC), and all
+; ticks that fall inside one output frame are merged into that frame. So a
+; 240 Hz song (Headbanger!) still puts one frame on the wire per VSYNC, with
+; four ZSM ticks' register writes applied together. Rates below 60 publish a
+; hold frame when no tick is due.
+;
 ; Frame buffer (double-buffered, ping-pong):
 ;   [psgCnt][reg,val]x psgCnt [ymCnt][reg,val]x ymCnt   (psgCnt=$FF = hold frame)
 ;   Decoder builds the next frame in the write buffer; on a frame boundary it
@@ -25,12 +32,16 @@
 ;
 ; Controls (in song): ESC/Q = stop -> menu, P/space = pause, M = mute,
 ;   +/- = vol, ]/[ = forward/backward 5 s, R = restart, L = loop toggle.
-; Menu: digit 1-9,0 selects song; ESC/Q exits to BASIC (RTS). STARTUP can
-; preselect the song by POKEing 1..11 to $6800 (sentinel, read+cleared).
+; Menu: digit 1-9,0 selects song; ESC/Q exits to BASIC (RTS).
+; External-name mode (used by the MELODIUS jukebox BASIC menus): BASIC writes
+; 'M','Z' at $6800 and a NUL-terminated ProDOS name at $6802, then BRUNs the
+; player with the ProDOS prefix set to the song's folder. The player plays
+; that file directly and RTSes back to BASIC when the song ends or ESC/Q is
+; pressed, so the menu program resumes where it left off.
 ; AUTOPLAY = 1 (injected via --autoplay build) auto-starts song 0 for headless.
 ;
 ; Conventions: asm6502.mjs syntax, VERA_BASE injected ($C200 slot2/$C400 slot4),
-; $2000 BRUN, dual slot. Code below $3800. Zero page $06-$2D.
+; $2000 BRUN, dual slot. Code below $3F00. Zero page $06-$37.
 ; ==============================================================================
 
 * = $2000
@@ -39,8 +50,8 @@ MLI         = $BF00
 STREAM_L = $06       ; feeder pointer into $4000 buffer (zp)
 STREAM_H = $07
 CNT      = $08
-FRAC     = $09       ; tick-rate accumulator (60Hz normalize)
-TICKRATE = $0A       ; ZSM tick rate (header byte 12; all songs = 60)
+FRAC     = $09       ; tick-rate remainder accumulator (decoder, 0..59)
+TICKRATE = $0A       ; ZSM tick rate (header bytes 12-13, low byte)
 FMMASK   = $0B       ; YM2151 channel mask (header byte 9)
 PSGMASK_L= $0C       ; PSG voice mask low (header byte 10)
 PSGMASK_H= $0D       ; PSG voice mask high (header byte 11)
@@ -84,6 +95,12 @@ MOVDST_L = $32       ; memmove dest (low, = FRAME + 2*psgCnt + 2)
 MOVDST_H = $33       ; (high)
 MOVCNT  = $34        ; memmove byte count (2*ymCnt, low)
 MOVCNT_H = $35       ; (high) -- 2*ymCnt can exceed 255
+FB_RD_L = $36        ; IRQ frame-read pointer (16-bit: a frame can exceed 255 B)
+FB_RD_H = $37
+; PCM window pointer uses $03/$04: Applesoft leaves $00-$05 free, and the
+; $06-$37 block is snapshotted/restored around BASIC, so this is outside it.
+PCM_PTR_L = $03
+PCM_PTR_H = $04
 
 BUF_LO  = $4000      ; 512-byte stream block buffer
 BUF_HI  = $4200
@@ -91,10 +108,15 @@ FB_A    = $7300      ; frame buffer A (512 B)  -- above ProDOS resident code + f
 FB_B    = $7500      ; frame buffer B (512 B)  -- 512 B apart from FB_A (no overlap)
 YM_SCRATCH = $7700   ; YM pair accumulation buffer (512 B)  -- 512 B apart from FB_B
 FILE_BUF = $6000
-PCM_BUFFER = $4400   ; PCM sample staging buffer (7168 B) -- free RAM below FB_A
-PCM_BUFFER_SIZE = $1C00  ; 7168 bytes (PCM_BUFFER..PCM_BUFFER+SIZE-1)
+PCM_BUFFER = $4400   ; PCM sample staging window (2048 B) -- streamed from disk
+PCM_BUFFER_SIZE = $800
 PCM_FILE_BUF = $6400 ; PCM refnum FCB (1024 B) -- free RAM below FILE_BUF+$400
-SEL_SENTINEL = $6800 ; STARTUP's POKE 26624,N (N=1..11 song preselect, cleared)
+EXT_MAGIC = $6800    ; BASIC menu: 'M','Z' marker (survives BRUN)
+EXT_NAME  = $6802    ; BASIC menu: NUL-terminated ProDOS name (max 15)
+INFO_TITLE = $6818   ; BASIC menu: NUL-terminated song title (15 chars)
+INFO_CAT   = $6828   ; BASIC menu: NUL-terminated category label (max 27)
+INFO_DUR   = $6850   ; BASIC menu: NUL-terminated "(m:ss)" song length
+ZP_SAVE   = $6A00    ; snapshot of Applesoft zero page $06-$37 (50 B)
 
 AUTOPLAY = 0         ; release: menu only. --autoplay build injects AUTOPLAY=1.
 AUTOSONG = 0         ; which song index AUTOPLAY auto-starts (injectable).
@@ -106,6 +128,15 @@ YM_DATA = VERA_BASE + $21   ; YM_DATA write (read = status)
 START:
     SEI
     CLD                   ; ADC below assumes binary mode
+    ; Applesoft keeps live interpreter state in zero page $06-$37. We are
+    ; CALLed from BASIC, so snapshot it now and restore before any RTS back.
+    LDX #$00
+ZP_SAVE_LOOP:
+    LDA $06,X
+    STA ZP_SAVE,X
+    INX
+    CPX #$32              ; 50 bytes: $06..$37
+    BNE ZP_SAVE_LOOP
     ; Normalize display banking for the 40-col PAGE1 text UI below.
     LDA #$00
     STA $C002              ; RAMRD main
@@ -138,33 +169,33 @@ START:
     STA REF_NUM
     STA PCM_ACTIVE
     STA PCM_REF
-    LDA #$FF
-    STA PCM_LOADED
 
 MENU:
+    ; External-name mode: BASIC sets 'M','Z' + a filename before BRUN.
+    ; Play it once, then RTS so the BASIC menu resumes after BRUN.
+    LDA EXT_MAGIC
+    CMP #$4D              ; 'M'
+    BNE MENU_STD
+    LDA EXT_MAGIC+1
+    CMP #$5A              ; 'Z'
+    BNE MENU_STD
+    LDA EXT_PLAYED
+    BNE MENU_EXT_RTS
+    LDA #$01
+    STA EXT_PLAYED
+    JMP PLAY_SONG
+MENU_EXT_RTS:
+    JSR RESTORE_ZP
+    RTS
+MENU_STD:
     JSR CLEAR_SCREEN
     JSR DRAW_MENU
     LDA #AUTOPLAY
-    BEQ MENU_PRE
-    ; autoplay build: ignore the preselect sentinel, play AUTOSONG
+    BEQ MENU_WAIT_KEY
+    ; autoplay build: play AUTOSONG without touching the menu
     LDA #AUTOSONG
     STA SONG_NUM
     JMP PLAY_SONG
-MENU_PRE:
-    ; preselect sentinel at $6800 (STARTUP POKE 26624): 1..11 -> song
-    LDA $6800
-    BEQ MENU_WAIT_KEY
-    CMP #$0C
-    BCS MENU_PRE_BAD
-    SEC
-    SBC #$01
-    STA SONG_NUM
-    LDA #$00
-    STA $6800
-    JMP PLAY_SONG
-MENU_PRE_BAD:
-    LDA #$00
-    STA $6800
 MENU_WAIT_KEY:
     LDA KBD_DATA
     BPL MENU_WAIT_KEY
@@ -206,7 +237,19 @@ DO_EXIT_JMP:
 ; --------------------------------------------------------------------------
 PLAY_SONG:
     JSR CLEAR_SCREEN
-    ; Resolve song name pointer: NAME_PTR = NAME_TBL[SONG_NUM]
+    ; Resolve song name pointer: external $6802 buffer, or NAME_TBL[SONG_NUM]
+    LDA EXT_MAGIC
+    CMP #$4D              ; 'M'
+    BNE PS_TABLE
+    LDA EXT_MAGIC+1
+    CMP #$5A              ; 'Z'
+    BNE PS_TABLE
+    LDA #<EXT_NAME
+    STA NAME_PTR_L
+    LDA #>EXT_NAME
+    STA NAME_PTR_H
+    JMP PS_NAME_SET
+PS_TABLE:
     LDA SONG_NUM
     ASL A                 ; *2
     TAY
@@ -214,6 +257,7 @@ PLAY_SONG:
     STA NAME_PTR_L
     LDA NAME_TBL+1,Y
     STA NAME_PTR_H
+PS_NAME_SET:
     LDA #$00
     STA ERR
     STA STREAM_END
@@ -251,6 +295,7 @@ POF1_OK:
     JMP PLAY_OPEN_FAIL
 POF2_OK:
     JSR CLEAR_SHADOW
+    JSR SHOW_INFO
     ; Initialize write-buffer base to FB_A before the first decode.
     LDA #$00
     STA WRB_BASE_L
@@ -369,9 +414,27 @@ READ_HEADER:
     STA PSGMASK_H
     JSR GETB               ; tickRate low
     STA TICKRATE
-    JSR GETB               ; tickRate high (all songs 60 -> ignore)
+    JSR GETB               ; tickRate high (library rates all fit in a byte)
     JSR GETB               ; reserved (header offset 0x0e)
     JSR GETB               ; reserved (header offset 0x0f)
+    ; Normalize the tick rate to the 60 Hz output frame: TICKS_PER_FRM whole
+    ; ticks per frame plus a TICK_REM/60 remainder carried in FRAC.
+    LDA TICKRATE
+    BNE RH_RATE_OK
+    LDA #60               ; malformed header: fall back to 60 Hz
+    STA TICKRATE
+RH_RATE_OK:
+    LDA #$00
+    STA TICKS_PER_FRM
+    LDA TICKRATE
+RH_RATE_DIV:
+    CMP #60
+    BCC RH_RATE_DONE
+    SBC #60
+    INC TICKS_PER_FRM
+    JMP RH_RATE_DIV
+RH_RATE_DONE:
+    STA TICK_REM
     ; Set up PCM if the song has a PCM table (pcmTableOffset != 0).
     JSR READ_PCM_SETUP
     LDA STREAM_END
@@ -382,18 +445,64 @@ RH_DONE:
     RTS
 
 ; --------------------------------------------------------------------------
-; DECODE_FRAME — decode events for one frame, publish when a boundary hits.
-; If HOLD_LEFT > 0 (a delay is in progress), publish one hold frame instead.
-; Returns after one publish; the caller loops. EOD -> DONE_FLAG.
+; DECODE_FRAME — produce one 60 Hz output frame. Normalizes the ZSM tick rate
+; (zsmkit semantics): advance TICKRATE/60 source ticks, merging their events
+; into the frame, and publish once. If no source tick is due yet (rate < 60),
+; publish a hold frame. EOD -> DONE_FLAG.
 ; --------------------------------------------------------------------------
 DECODE_FRAME:
+    ; source ticks this frame = TICKS_PER_FRM + carry from FRAC + TICK_REM
+    LDA FRAC
+    CLC
+    ADC TICK_REM
+    CMP #60
+    BCC DF_NO_CARRY
+    SBC #60               ; carry set
+    STA FRAC
+    LDA TICKS_PER_FRM
+    CLC
+    ADC #$01
+    JMP DF_SET_N
+DF_NO_CARRY:
+    STA FRAC
+    LDA TICKS_PER_FRM
+DF_SET_N:
+    STA TICKS_LEFT
+    BNE DF_START
+    JSR PUBLISH_HOLD
+    RTS
+DF_START:
+    JSR FRAME_START
+    LDA #$00
+    STA FRAME_PUB
+DF_TICK_LOOP:
+    JSR DECODE_ONE_TICK
+    LDA FRAME_PUB
+    BNE DF_RET            ; EOD / stream end already published the frame
+    DEC TICKS_LEFT
+    BNE DF_TICK_LOOP
+    JSR PUBLISH_FRAME
+DF_RET:
+    RTS
+
+; --------------------------------------------------------------------------
+; DECODE_ONE_TICK — advance the stream by one ZSM tick. Events accumulate in
+; the current frame; a delay consumes tick slots via HOLD_LEFT. On EOD or a
+; truncated stream the partial frame is published and FRAME_PUB set.
+; FRM0/1/2 count source ticks, keeping [ ] seeks correct at any tick rate.
+; --------------------------------------------------------------------------
+DECODE_ONE_TICK:
+    INC FRM0
+    BNE DOT_NO1
+    INC FRM1
+    BNE DOT_NO1
+    INC FRM2
+DOT_NO1:
     LDA HOLD_LEFT
     BEQ DF_NORMAL
-    JSR PUBLISH_HOLD
     DEC HOLD_LEFT
     RTS
 DF_NORMAL:
-    JSR FRAME_START
     LDA STREAM_END
     BEQ DF_LOOP
     JMP DF_END
@@ -530,10 +639,11 @@ DF_DELAY:
     SEC
     SBC #$01
     STA HOLD_LEFT
-    JSR PUBLISH_FRAME
     RTS
 DF_EOD:
     JSR PUBLISH_FRAME
+    LDA #$01
+    STA FRAME_PUB
     LDA #$14
     STA DEBUG_MARKER
     LDA LOOP_OFF_L
@@ -546,6 +656,8 @@ DF_EOD:
     RTS
 DF_END:
     JSR PUBLISH_FRAME
+    LDA #$01
+    STA FRAME_PUB
     LDA #$15
     STA DEBUG_MARKER
     LDA #$01
@@ -702,13 +814,10 @@ PUBLISH_HOLD:
 ; FB_ACT=base, FB_READY=1, swap write buffer.
 ; --------------------------------------------------------------------------
 PUBLISH_FRAME:
-    LDA #$00
-    STA PCM_FED_L
-    STA PCM_FED_H
     LDA IRQ_ACTIVE
     BEQ PUB_NOWAIT
 PUB_WAIT:
-    JSR FEED_PCM
+    JSR PCM_FEED            ; top up the VERA FIFO while the tick is pending
     LDA FB_READY
     BNE PUB_WAIT
 PUB_NOWAIT:
@@ -906,7 +1015,20 @@ SS_D1:
 SS_D2:
     CMP #$41
     BCC SS_PSG
-    JMP SS_YM
+    CMP #$81
+    BCC SS_YM
+    ; $81-$FF: tick delay, one byte already consumed by GETB. The old branch
+    ; fell into SS_YM and ate the next (cmd&$3F)*2 bytes as fake YM pairs:
+    ; Crockett has 5,605 delay commands, so the ]/[ seek ran ~11,210 bytes
+    ; past where the decoder was and the frame count went wildly wrong.
+    ; DECODE_FRAME semantics: HOLD_LEFT = (cmd&$7F)-1, consume this frame.
+    LDA CMD
+    AND #$7F
+    SEC
+    SBC #$01
+    STA HOLD_LEFT
+    CLC
+    RTS
 SS_PSG:
     JSR GETB
     STA VAL_TMP
@@ -1016,10 +1138,31 @@ SS_EOD_DONE:
     SEC
     RTS
 
-; DO_SEEK_FWD — fast-forward 5 s (300 frames @ 60 Hz).  Decodes frames
-; through SEEK_STEP (SHADOW-only, no publish), then restores the PSG from
-; SHADOW.  On EOD+loop the file cursor ends up at loopOffset; on EOD with no
-; loop DONE_FLAG=1 (MAIN -> SONG_DONE).  Clock jumps +5 s.
+; CALC_SEEK_TICKS — SEEK_CNT = 5 seconds of source ticks = 5 * TICKRATE.
+; SEEK_STEP advances one source tick, so the distance scales with the tick
+; rate (Headbanger! at 240 Hz needs 1200 ticks, not 300).
+CALC_SEEK_TICKS:
+    LDA TICKRATE
+    STA SEEK_CNT_L
+    LDA #$00
+    STA SEEK_CNT_H
+    ASL SEEK_CNT_L
+    ROL SEEK_CNT_H
+    ASL SEEK_CNT_L
+    ROL SEEK_CNT_H
+    LDA SEEK_CNT_L
+    CLC
+    ADC TICKRATE
+    STA SEEK_CNT_L
+    LDA SEEK_CNT_H
+    ADC #$00
+    STA SEEK_CNT_H
+    RTS
+
+; DO_SEEK_FWD — fast-forward 5 s.  Decodes 5*TICKRATE source ticks through
+; SEEK_STEP (SHADOW-only, no publish), then restores the PSG from SHADOW.
+; On EOD+loop the file cursor ends up at loopOffset; on EOD with no loop
+; DONE_FLAG=1 (MAIN -> SONG_DONE).  Clock jumps +5 s.
 DO_SEEK_FWD:
     LDA IRQ_ACTIVE
     BEQ SF_NOWAIT
@@ -1027,10 +1170,7 @@ SF_WAIT:
     LDA FB_READY
     BNE SF_WAIT
 SF_NOWAIT:
-    LDA #<300
-    STA SEEK_CNT_L
-    LDA #>300
-    STA SEEK_CNT_H
+    JSR CALC_SEEK_TICKS
 SF_LOOP:
     JSR SEEK_STEP
     BCS SF_DONE
@@ -1070,8 +1210,8 @@ SF_CLK_OK:
     CLI
     JMP MAIN
 
-; DO_SEEK_BWD — rewind 5 s (up to 300 frames, clamped at song start).
-; SET_MARK(0) the file cursor, clear SHADOW, fast-scan TARG frames, clock
+; DO_SEEK_BWD — rewind 5 s (5*TICKRATE source ticks, clamped at song start).
+; SET_MARK(0) the file cursor, clear SHADOW, fast-scan TARG ticks, clock
 ; -= 5 s (with borrow).  FRM0/1/2 restart from 0 and end at TARG.
 DO_SEEK_BWD:
     LDA IRQ_ACTIVE
@@ -1080,12 +1220,13 @@ SB_WAIT:
     LDA FB_READY
     BNE SB_WAIT
 SB_NOWAIT:
+    JSR CALC_SEEK_TICKS
     SEC
     LDA FRM0
-    SBC #<300
+    SBC SEEK_CNT_L
     STA TARG_L
     LDA FRM1
-    SBC #>300
+    SBC SEEK_CNT_H
     STA TARG_H
     BCS SB_TARG_OK
     LDA #$00
@@ -1200,13 +1341,16 @@ DO_LOOP:
     LDA LOOP_EN
     EOR #$01
     STA LOOP_EN
+    JSR SHOW_LOOP_TAG
     JMP MAIN
 
 ; --------------------------------------------------------------------------
-; PCM support (full ZSM: PSG + FM + PCM). PCM samples are staged in
-; PCM_BUFFER (bulk-read at trigger) and fed to the VERA FIFO ($Cn1D) from
-; the main loop's idle PUB_WAIT. Uses a 2nd refnum (PCM_REF) so the main
-; ZSM stream cursor is untouched.
+; PCM support (full ZSM: PSG + FM + PCM). A sample is streamed from the
+; companion file in PCM_BUFFER_SIZE windows and pushed into the VERA audio
+; FIFO ($Cn1D) by PCM_FEED, the 128-byte bounded page-indexed feeder from
+; pcmstream.asm; the FIFO-full flag is the only pacing, exactly as zsmkit's
+; _pcm_player treats the hardware. A 2nd refnum (PCM_REF) keeps the main ZSM
+; stream cursor untouched.
 ; --------------------------------------------------------------------------
 
 ; READ_PCM_SETUP — called after READ_HEADER. PCM_TBL_L/M/H = pcmTableOffset
@@ -1221,17 +1365,22 @@ READ_PCM_SETUP:
 RPS_HAVE:
     JSR OPEN_PCM
     LDA ERR
-    BEQ RPS_OK
-    JMP RPS_RTS
+    BNE RPS_SKIP
+    ; OPEN_PCM clears the header flag when there is no companion file.
+    LDA PCM_TBL_L
+    ORA PCM_TBL_M
+    ORA PCM_TBL_H
+    BEQ RPS_SKIP
+    JMP RPS_OK
+RPS_SKIP:
+    RTS
 RPS_OK:
-    ; SET_MARK(pcmTableOffset) on PCM_REF
+    ; The companion file starts at the ZSM's pcmTableOffset, so the table is at 0.
     LDA PCM_REF
     STA SETMARK_PARAMS+1
-    LDA PCM_TBL_L
+    LDA #$00
     STA SETMARK_PARAMS+2
-    LDA PCM_TBL_M
     STA SETMARK_PARAMS+3
-    LDA PCM_TBL_H
     STA SETMARK_PARAMS+4
     JSR MLI
     !byte $CE
@@ -1276,29 +1425,23 @@ RPS_EOF:
 RPS_READ:
     ; verify "PCM" magic
     LDA PCM_TMP
-    CMP #'P'
+    CMP #$50              ; 'P'
     BNE RPS_NOMAGIC
     LDA PCM_TMP+1
-    CMP #'C'
+    CMP #$43              ; 'C'
     BNE RPS_NOMAGIC
     LDA PCM_TMP+2
-    CMP #'M'
+    CMP #$4D              ; 'M'
     BNE RPS_NOMAGIC
     LDA PCM_TMP+3
     STA PCM_INST_MAX
 RPS_NOMAGIC:
 RPS_CALC:
-    ; DATA_BASE = PCM_TBL + 4 + (instMax+1)*16
-    ; = PCM_TBL + 20 + (instMax<<4)
-    LDA PCM_TBL_L
-    CLC
-    ADC #$14
+    ; DATA_BASE = 20 + (instMax<<4), relative to the companion file
+    LDA #$14
     STA PCM_DATA_BASE_L
-    LDA PCM_TBL_M
-    ADC #$00
+    LDA #$00
     STA PCM_DATA_BASE_M
-    LDA PCM_TBL_H
-    ADC #$00
     STA PCM_DATA_BASE_H
     LDA PCM_INST_MAX
     ASL A
@@ -1321,31 +1464,56 @@ RPS_CALC:
 RPS_RTS:
     RTS
 
-; OPEN_PCM — open the same ZSM file a 2nd time (PCM_REF). Reuses PATH_BUF
-; (already built by OPEN_STREAM); uses PCM_FILE_BUF as its FCB.
+; OPEN_PCM — open the companion "<name>.PCM" file that the build step split out
+; of the ZSM at pcmTableOffset. ProDOS 8 refuses a second FCB on a file that is
+; already open ($50), so the samples have to live in their own file.
 OPEN_PCM:
     LDA #$00
     STA ERR
+    ; OPEN_PARAMS+5 is the slot/drive input *and* the refnum output, so the
+    ; previous OPEN left a refnum here; 0 means "use the current prefix".
+    STA OPEN_PARAMS+5
     LDA #$03
     STA OPEN_PARAMS
     LDA #<PCM_FILE_BUF
     STA OPEN_PARAMS+3
     LDA #>PCM_FILE_BUF
     STA OPEN_PARAMS+4
+    JSR SWAP_PCM_EXT
     JSR MLI
     !byte $C8
     !word OPEN_PARAMS
-    BCC OPEN_PCM_OK
+    BCS OPEN_PCM_ERR      ; carry set = MLI error, A = error code
+    LDA OPEN_PARAMS+5
+    STA PCM_REF
+    RTS
+OPEN_PCM_ERR:
+    CMP #$46              ; file not found -> play the song without its samples
+    BNE OPEN_PCM_FAIL
+    LDA #$00
+    STA PCM_TBL_L
+    STA PCM_TBL_M
+    STA PCM_TBL_H
+    RTS
+OPEN_PCM_FAIL:
     STA ERRCODE
     LDA #$44
     STA ERRSRC
-    LDA ERRCODE
     LDA #$01
     STA ERR
     RTS
-OPEN_PCM_OK:
-    LDA OPEN_PARAMS+5
-    STA PCM_REF
+
+; SWAP_PCM_EXT — rewrite the trailing "ZSM" of PATH_BUF as "PCM". The name is a
+; Pascal string, so its last character sits at PATH_BUF+length.
+SWAP_PCM_EXT:
+    LDA PATH_BUF
+    TAX
+    LDA #$50              ; 'P'
+    STA PATH_BUF-2,X
+    LDA #$43              ; 'C'
+    STA PATH_BUF-1,X
+    LDA #$4D              ; 'M'
+    STA PATH_BUF,X
     RTS
 
 ; PCM_APPLY_EVENT — apply one [sub,val] PCM sub-event decoded from EXTCMD.
@@ -1372,46 +1540,19 @@ PCM_EV_RTS:
 PCM_EV_RATE:
     LDA PCM_VAL
     STA PCM_RATE
-    ; effRate = (rate>128)?(256-rate):rate
+    ; effRate = (rate>128)?(256-rate):rate -- VERA's own conversion, kept only
+    ; to print the sample rate in the status line.
     CMP #$80
     BCC PCM_RATE_LE128
     LDA #$00
     SEC
     SBC PCM_RATE
     STA PCM_EFFRATE
-    JMP PCM_RATE_BUDGET
+    JMP PCM_RATE_WRITE
 PCM_RATE_LE128:
-    LDA PCM_RATE
+    LDA PCM_VAL
     STA PCM_EFFRATE
-PCM_RATE_BUDGET:
-    ; budget = effRate*7 + 128  (16-bit)
-    LDA PCM_EFFRATE
-    STA PCM_TMP
-    LDA #$00
-    STA PCM_TMP+1
-    ; <<3 (effRate*8)
-    ASL PCM_TMP
-    ROL PCM_TMP+1
-    ASL PCM_TMP
-    ROL PCM_TMP+1
-    ASL PCM_TMP
-    ROL PCM_TMP+1
-    ; - effRate (effRate*7)
-    LDA PCM_TMP
-    SEC
-    SBC PCM_EFFRATE
-    STA PCM_TMP
-    LDA PCM_TMP+1
-    SBC #$00
-    STA PCM_TMP+1
-    ; + 128
-    LDA PCM_TMP
-    CLC
-    ADC #$80
-    STA PCM_BUDGET_L
-    LDA PCM_TMP+1
-    ADC #$00
-    STA PCM_BUDGET_H
+PCM_RATE_WRITE:
     ; write rate register
     LDA PCM_RATE
     STA VERA_AUDIO_RATE
@@ -1433,20 +1574,15 @@ PCM_WRITE_CTRL:
     STA VERA_AUDIO_CTRL
     RTS
 
-; PCM_TRIGGER — A = instrument idx. Read its 16-byte entry from the table,
-; bulk-read its sample data into PCM_BUFFER (if not loaded), set up state.
+; PCM_TRIGGER — A = instrument idx. Read its 16-byte entry from the companion
+; file's table, then start streaming its sample data in PCM_BUFFER_SIZE windows.
 PCM_TRIGGER:
     STA PCM_INST
-    ; entryAddr = PCM_TBL + 4 + (idx<<4)
-    LDA PCM_TBL_L
-    CLC
-    ADC #$04
+    ; entryAddr = 4 + (idx<<4), relative to the companion file
+    LDA #$04
     STA SETMARK_PARAMS+2
-    LDA PCM_TBL_M
-    ADC #$00
+    LDA #$00
     STA SETMARK_PARAMS+3
-    LDA PCM_TBL_H
-    ADC #$00
     STA SETMARK_PARAMS+4
     LDA PCM_INST
     ASL A
@@ -1560,236 +1696,354 @@ PT_LOOPPT:
     LDA PCM_DATA_BASE_H
     ADC PCM_OFF_H
     STA PCM_FILE_OFF_H
-    ; load data into PCM_BUFFER if not loaded
-    LDA PCM_LOADED
-    CMP PCM_INST
-    BEQ PT_LOADED
-    ; SET_MARK(fileOffset) on PCM_REF
-    LDA PCM_REF
-    STA SETMARK_PARAMS+1
-    LDA PCM_FILE_OFF_L
-    STA SETMARK_PARAMS+2
-    LDA PCM_FILE_OFF_M
-    STA SETMARK_PARAMS+3
-    LDA PCM_FILE_OFF_H
-    STA SETMARK_PARAMS+4
-    JSR MLI
-    !byte $CE
-    !word SETMARK_PARAMS
-    BCC PT_MARK2
-    STA ERRCODE
-    LDA #$47
-    STA ERRSRC
-    LDA ERRCODE
-    LDA #$01
-    STA ERR
-    RTS
-PT_MARK2:
-    JSR PCM_READ_DATA
-    LDA ERR
-    BNE PT_RTS
-    LDA PCM_INST
-    STA PCM_LOADED
-PT_LOADED:
+    ; The sample is streamed from disk in PCM_BUFFER_SIZE windows while it
+    ; plays, so a trigger only has to reset the position.
     LDA #$00
     STA PCM_POS_L
     STA PCM_POS_M
     STA PCM_POS_H
+    STA PP_LEFT_L
+    STA PP_LEFT_H
+    ; a loop point at/after the end would make PCM_FEED spin without
+    ; advancing the byte counter, so treat it as non-looped
+    LDA PCM_LOOPED
+    BEQ PT_START
+    LDA PCM_LOOP_H
+    CMP PCM_LEN_H
+    BCC PT_START
+    BNE PT_LOOP_OFF
+    LDA PCM_LOOP_M
+    CMP PCM_LEN_M
+    BCC PT_START
+    BNE PT_LOOP_OFF
+    LDA PCM_LOOP_L
+    CMP PCM_LEN_L
+    BCC PT_START
+PT_LOOP_OFF:
+    LDA #$00
+    STA PCM_LOOPED
+PT_START:
     LDA #$01
     STA PCM_ACTIVE
+    ; zsmkit's _pcm_trigger_instrument nukes the FIFO on every trigger
+    ; ("nuke any fifo contents immediately", zsmkit.s line 1054) so a new
+    ; drum never starts from the previous drum's queued bytes. On the //e
+    ; the queued leftovers are exactly what made Crockett crackle: the
+    ; hardware keeps eating the old drum's bytes at the old rate while the
+    ; new trigger's bytes queue behind them. Flush before refilling.
+    LDA PCM_CTRL
+    ORA #$80
+    STA VERA_AUDIO_CTRL
+    ; zsmkit/_pcm_player holds AudioRate at 0 while the FIFO is cold so the
+    ; prefill isn't drained as it is written. On the //e that also covers the
+    ; milliseconds a disk window refill costs.
+    LDA #$00
+    STA VERA_AUDIO_RATE
     JSR PCM_WRITE_CTRL
+    JSR PCM_FILL_WINDOW
+    LDA PCM_IOERR
+    BNE PT_FAIL
+    LDA PCM_ACTIVE
+    BEQ PT_RTS
+    JSR PCM_PREFILL
     LDA PCM_RATE
     STA VERA_AUDIO_RATE
 PT_RTS:
     RTS
+PT_FAIL:
+    ; No sample data: leave the drums off but keep the song playing.
+    LDA #$00
+    STA PCM_ACTIVE
+    RTS
 
-; PCM_READ_DATA — bulk-read PCM_LEN bytes (from PCM_REF, current position)
-; into PCM_BUFFER, capped at PCM_BUFFER_SIZE. 24-bit count.
-PCM_READ_DATA:
-    LDA #<PCM_BUFFER
-    STA PCM_DST_L
-    LDA #>PCM_BUFFER
-    STA PCM_DST_H
+; PCM_FILL_WINDOW — load the next window of the current sample (starting at
+; sample position PCM_POS) into PCM_BUFFER and arm the feed cursor (PCM_PTR /
+; PP_LEFT). Sets PCM_ACTIVE=0 when the sample is exhausted and PCM_IOERR if the
+; disk access fails. PCM_IOERR is private so a sample read never aborts the
+; song the way a stream error does.
+PCM_FILL_WINDOW:
+    LDA #$00
+    STA PCM_IOERR
+    STA PP_LEFT_L
+    STA PP_LEFT_H
+    ; filePos = PCM_FILE_OFF + PCM_POS
+    LDA PCM_FILE_OFF_L
+    CLC
+    ADC PCM_POS_L
+    STA PCM_FPOS_L
+    LDA PCM_FILE_OFF_M
+    ADC PCM_POS_M
+    STA PCM_FPOS_M
+    LDA PCM_FILE_OFF_H
+    ADC PCM_POS_H
+    STA PCM_FPOS_H
+    ; count = min(PCM_LEN - PCM_POS, PCM_BUFFER_SIZE)
     LDA PCM_LEN_L
+    SEC
+    SBC PCM_POS_L
     STA PCM_COUNT_L
     LDA PCM_LEN_M
+    SBC PCM_POS_M
     STA PCM_COUNT_M
     LDA PCM_LEN_H
+    SBC PCM_POS_H
     STA PCM_COUNT_H
-    ; cap count at PCM_BUFFER_SIZE ($1C00 = 7168)
     LDA PCM_COUNT_H
-    CMP #$1C
-    BCC PRD_LOOP
+    BNE PFW_CAP
+    LDA PCM_COUNT_M
+    CMP #>PCM_BUFFER_SIZE
+    BCC PFW_MARK
+PFW_CAP:
     LDA #$00
     STA PCM_COUNT_L
-    LDA #$1C
-    STA PCM_COUNT_M
-    LDA #$00
     STA PCM_COUNT_H
-PRD_LOOP:
-    LDA PCM_COUNT_L
-    ORA PCM_COUNT_M
-    ORA PCM_COUNT_H
-    BNE PRD_CONT
-    JMP PRD_DONE
-PRD_CONT:
-    ; chunk = min(512, count)
-    LDA PCM_COUNT_H
-    BNE PRD_512
-    LDA PCM_COUNT_M
-    CMP #$02
-    BCS PRD_512
-    LDA PCM_COUNT_L
-    STA PCM_CHUNK_L
-    LDA #$00
-    STA PCM_CHUNK_H
-    JMP PRD_READY
-PRD_512:
-    LDA #$00
-    STA PCM_CHUNK_L
-    LDA #$02
-    STA PCM_CHUNK_H
-PRD_READY:
+    LDA #>PCM_BUFFER_SIZE
+    STA PCM_COUNT_M
+PFW_MARK:
+    LDA PCM_REF
+    STA SETMARK_PARAMS+1
+    LDA PCM_FPOS_L
+    STA SETMARK_PARAMS+2
+    LDA PCM_FPOS_M
+    STA SETMARK_PARAMS+3
+    LDA PCM_FPOS_H
+    STA SETMARK_PARAMS+4
+    JSR MLI
+    !byte $CE
+    !word SETMARK_PARAMS
+    BCC PFW_READ
+    STA ERRCODE
+    LDA #$47
+    STA ERRSRC
+    LDA #$01
+    STA PCM_IOERR
+    RTS
+PFW_READ:
     LDA PCM_REF
     STA READ_PARAMS+1
-    LDA PCM_DST_L
+    LDA #<PCM_BUFFER
     STA READ_PARAMS+2
-    LDA PCM_DST_H
+    LDA #>PCM_BUFFER
     STA READ_PARAMS+3
-    LDA PCM_CHUNK_L
+    LDA PCM_COUNT_L
     STA READ_PARAMS+4
-    LDA PCM_CHUNK_H
+    LDA PCM_COUNT_M
     STA READ_PARAMS+5
     JSR MLI
     !byte $CA
     !word READ_PARAMS
-    BCC PRD_READ2
+    BCC PFW_DONE
     CMP #$4C
-    BEQ PRD_EOF
+    BEQ PFW_EMPTY
     STA ERRCODE
     LDA #$48
     STA ERRSRC
-    LDA ERRCODE
     LDA #$01
-    STA ERR
+    STA PCM_IOERR
     RTS
-PRD_EOF:
+PFW_DONE:
+    ; Arm the feed cursor: PCM_BUFFER holds the window that starts at sample
+    ; position PCM_POS, PP_LEFT bytes of it are still unfed.
+    LDA #<PCM_BUFFER
+    STA PCM_PTR_L
+    LDA #>PCM_BUFFER
+    STA PCM_PTR_H
+    LDA READ_PARAMS+6
+    ORA READ_PARAMS+7
+    BEQ PFW_EMPTY
+    LDA READ_PARAMS+6
+    STA PP_LEFT_L
+    LDA READ_PARAMS+7
+    STA PP_LEFT_H
+    RTS
+PFW_EMPTY:
+    ; A short/empty read is the logical end of the sample.
     LDA #$00
     STA PCM_ACTIVE
-    JMP PRD_DONE
-PRD_READ2:
-    ; dest += bytesRead
-    LDA READ_PARAMS+6
-    CLC
-    ADC PCM_DST_L
-    STA PCM_DST_L
-    LDA READ_PARAMS+7
-    ADC PCM_DST_H
-    STA PCM_DST_H
-    ; count -= bytesRead
-    LDA READ_PARAMS+6
-    STA PCM_TMP
-    LDA READ_PARAMS+7
-    STA PCM_TMP+1
-    LDA PCM_COUNT_L
-    SEC
-    SBC PCM_TMP
-    STA PCM_COUNT_L
-    LDA PCM_COUNT_M
-    SBC PCM_TMP+1
-    STA PCM_COUNT_M
-    LDA PCM_COUNT_H
-    SBC #$00
-    STA PCM_COUNT_H
-    JMP PRD_LOOP
-PRD_DONE:
+PFW_RTS:
     RTS
 
-; FEED_PCM — push PCM_BUFFER[pcmPos] to the VERA FIFO. Called from PUB_WAIT
-; (main loop idle). Bounded by per-frame budget + FIFO-full.
-FEED_PCM:
+
+; PCM_FEED — top up the VERA PCM FIFO from the staged window. Ported from
+; pcmstream.asm's FEED_BLOCK_BYTES, the feeder the jukebox PCM tracks are
+; known-good with: a page-indexed loop of at most 128 bytes that exits on the
+; FIFO-full flag, ~25 cycles per byte, with the window refill done once per
+; window instead of once per byte. The previous version recomputed the 24-bit
+; sample position, the window bounds and the buffer address for *every* byte
+; (~140 cycles), so a 27 kHz track needed 3.9M cycles/s -- more than the //e
+; has at any speed. The FIFO then starves, VERA outputs silence on underrun,
+; and on a signal as small as TREE's (a few LSBs of swing) the dropouts are
+; what sounded like noise.
+PF_NO:
+    RTS
+
+PCM_FEED:
+    LDA PAUSE
+    BNE PF_NO                 ; frozen clock: don't queue audio behind the pause
     LDA PCM_ACTIVE
-    BEQ FP_RTS
-    LDA PCM_FED_H
-    CMP PCM_BUDGET_H
-    BCS FP_RTS
-    BNE FP_DO
-    LDA PCM_FED_L
-    CMP PCM_BUDGET_L
-    BCS FP_RTS
-FP_DO:
-    ; FIFO full?
-    LDA VERA_AUDIO_CTRL
-    AND #$80
-    BNE FP_RTS
-    ; push PCM_BUFFER[pcmPos]
-    JSR FP_PUSH_ONE
-FP_RTS:
+    BEQ PF_NO
+    LDA #$08
+    STA PP_PASSES             ; at most 8 x 128 = 1024 bytes per call
+PF_PASS:
+    LDA PP_LEFT_L
+    ORA PP_LEFT_H
+    BEQ PF_WINDOW_OUT
+    ; quota = min(PP_LEFT, 128)
+    LDA PP_LEFT_H
+    BNE PF_QUOTA128
+    LDA PP_LEFT_L
+    CMP #$80
+    BCC PF_QUOTA_SET
+PF_QUOTA128:
+    LDA #$80
+PF_QUOTA_SET:
+    STA PP_QUOTA
+    LDY #$00
+PF_LOOP:
+    LDA VERA_AUDIO_CTRL       ; bit 7 = FIFO full
+    BMI PF_FED
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    CPY PP_QUOTA
+    BNE PF_LOOP
+PF_FED:
+    ; Y = bytes pushed this pass
+    TYA
+    BEQ PF_RTS
+    STY PP_TMPY
+    ; PCM_PTR += Y
+    CLC
+    ADC PCM_PTR_L
+    STA PCM_PTR_L
+    BCC PF_PTR_DONE
+    INC PCM_PTR_H
+PF_PTR_DONE:
+    ; PP_LEFT -= Y
+    LDA PP_LEFT_L
+    SEC
+    SBC PP_TMPY
+    STA PP_LEFT_L
+    LDA PP_LEFT_H
+    SBC #$00
+    STA PP_LEFT_H
+    ; PCM_POS += Y (once per pass, not once per byte)
+    LDA PCM_POS_L
+    CLC
+    ADC PP_TMPY
+    STA PCM_POS_L
+    LDA PCM_POS_M
+    ADC #$00
+    STA PCM_POS_M
+    LDA PCM_POS_H
+    ADC #$00
+    STA PCM_POS_H
+    ; a short pass means the FIFO was full: resume on the next call
+    TYA
+    CMP PP_QUOTA
+    BCC PF_RTS
+    DEC PP_PASSES
+    BNE PF_PASS
+    RTS
+PF_RTS:
     RTS
 
-; FP_PUSH_ONE — push one byte from PCM_BUFFER[pcmPos], advance pcmPos,
-; handle loop/end. Clobbers A/Y.
-FP_PUSH_ONE:
-    ; pcmPos >= PCM_LEN?
+PF_WINDOW_OUT:
+    ; The staged window ran out. At the end of the sample?
     LDA PCM_POS_H
     CMP PCM_LEN_H
-    BCC FP_OK
-    BNE FP_END
+    BCC PF_REFILL
+    BNE PF_SAMPLE_END
     LDA PCM_POS_M
     CMP PCM_LEN_M
-    BCC FP_OK
-    BNE FP_END
+    BCC PF_REFILL
+    BNE PF_SAMPLE_END
     LDA PCM_POS_L
     CMP PCM_LEN_L
-    BCS FP_END
-FP_OK:
-    ; byte = PCM_BUFFER[pcmPos]
-    LDA PCM_POS_L
-    CLC
-    ADC #<PCM_BUFFER
-    STA PCM_FP_ADDR_L
-    LDA PCM_POS_M
-    ADC #>PCM_BUFFER
-    STA PCM_FP_ADDR_H
-    LDY #$00
-    LDA (PCM_FP_ADDR_L),Y
-    STA VERA_AUDIO_DATA
-    ; pcmPos++
-    INC PCM_POS_L
-    BNE FP_DONE
-    INC PCM_POS_M
-    BNE FP_DONE
-    INC PCM_POS_H
-FP_DONE:
-    ; PCM_FED++
-    INC PCM_FED_L
-    BNE FP_DONE2
-    INC PCM_FED_H
-FP_DONE2:
-    RTS
-FP_END:
-    ; end of sample: loop or stop
+    BCC PF_REFILL
+PF_SAMPLE_END:
+    ; zsmkit/_pcm_player: a looped instrument restarts at its loop point, an
+    ; unlooped one frees the PCM channel.
     LDA PCM_LOOPED
-    BEQ FP_STOP
-    ; pcmPos = loopPoint
+    BEQ PF_STOP
     LDA PCM_LOOP_L
     STA PCM_POS_L
     LDA PCM_LOOP_M
     STA PCM_POS_M
     LDA PCM_LOOP_H
     STA PCM_POS_H
-    RTS
-FP_STOP:
+PF_REFILL:
+    JSR PCM_FILL_WINDOW
+    ; A failed window read only stops the drums, not the song.
+    LDA PCM_IOERR
+    BNE PF_STOP
+    LDA PCM_ACTIVE
+    BEQ PF_RTS
+    JMP PF_PASS
+PF_STOP:
     LDA #$00
     STA PCM_ACTIVE
     RTS
 
-; PCM_KEY_OFF — silence PCM on song end/exit.
+; PCM_PREFILL — queue the whole 4 KB FIFO before the sample clock starts, the
+; way pcmstream.asm's PREFILL_FIFO does (32 x 128) and for the same reason: a
+; stream that starts from an empty FIFO underruns on its very first blocks.
+; PCM_FEED only touches A/Y, so X is a safe counter across the calls.
+PCM_PREFILL:
+    LDX #$20
+PPF_LOOP:
+    JSR PCM_FEED
+    LDA VERA_AUDIO_CTRL
+    BMI PPF_DONE              ; full
+    LDA PCM_ACTIVE
+    BEQ PPF_DONE
+    DEX
+    BNE PPF_LOOP
+PPF_DONE:
+    RTS
+
+; PCM_DRAIN — natural end only: let the queued audio play out before silencing
+; (pcmstream.asm's DRAIN_FIFO). A keypress cuts the tail and exits.
+PCM_DRAIN:
+    LDX #$FF
+    LDY #$40                  ; ~1 s fallback, as in pcmstream
+PD_LOOP:
+    LDA VERA_AUDIO_CTRL
+    AND #$40
+    BNE PD_DONE               ; FIFO empty
+    LDA KBD_DATA
+    BPL PD_NOKEY
+    STA KBD_STROBE
+    JMP PD_DONE
+PD_NOKEY:
+    JSR SHOW_STATUS
+    DEX
+    BNE PD_LOOP
+    DEY
+    BNE PD_LOOP
+PD_DONE:
+    RTS
+
+; PCM_MUTE — silence the sample by zeroing the AudioCtrl volume. Bit 7 stays
+; clear on purpose: flushing the FIFO would throw away queued audio and make
+; the track resume from the wrong position.
+PCM_MUTE:
+    LDA PCM_CTRL
+    AND #$F0
+    STA VERA_AUDIO_CTRL
+    RTS
+
+; PCM_KEY_OFF — silence PCM on song end/exit. A bare $80 write is the flush:
+; read-modify-writing the hardware ctrl is wrong on the //e because AppleWin's
+; ReadPcmCtrl mixes the FIFO status bits into the read (empty = $40, full =
+; $80). With an empty FIFO the read-back $xx|$40 ORA'd with $80 became
+; $xx|$C0, AppleWin's WritePcmCtrl read that as (value&0xC0)==0xC0 = "loop
+; mode" instead of a flush and additionally ran fifoRestart() -- the leftover
+; FIFO bytes then looped forever, which is exactly the ESC residual audio.
 PCM_KEY_OFF:
     LDA #$00
     STA PCM_ACTIVE
-    LDA VERA_AUDIO_CTRL
-    ORA #$80
+    LDA #$80
     STA VERA_AUDIO_CTRL
     RTS
 
@@ -1812,6 +2066,7 @@ PCM_CLOSE_DONE:
 SONG_DONE:
     LDA #$17
     STA DEBUG_MARKER
+    JSR PCM_DRAIN
     JSR PCM_KEY_OFF
     JSR PCM_CLOSE
     JSR FM_KEY_OFF
@@ -1842,6 +2097,7 @@ DO_EXIT:
     JSR PCM_KEY_OFF
     JSR PCM_CLOSE
     JSR CLOSE_STREAM
+    JSR RESTORE_ZP
     RTS                   ; back to BASIC.SYSTEM (BRUN entry)
 
 DO_MUTE:
@@ -1851,10 +2107,12 @@ DO_MUTE:
     LDA #$01
     STA MUTE
     JSR SILENCE_ALL
+    JSR PCM_MUTE
     CLI
     JMP MAIN
 DO_UNMUTE:
     JSR RESTORE_ALL
+    JSR PCM_WRITE_CTRL
     LDA #$00
     STA MUTE
     CLI
@@ -1865,10 +2123,16 @@ DO_PAUSE:
     BNE DO_RESUME
     LDA #$01
     STA PAUSE
+    ; pcmstream.asm freezes a PCM stream by zeroing AudioRate; the same trick
+    ; holds the FIFO's queued audio in place so P resumes mid-sample.
+    LDA #$00
+    STA VERA_AUDIO_RATE
     JMP MAIN
 DO_RESUME:
     LDA #$00
     STA PAUSE
+    LDA PCM_RATE
+    STA VERA_AUDIO_RATE
     JMP MAIN
 
 DO_VOL_UP:
@@ -1934,6 +2198,20 @@ NIBD_ERR:
     ORA #$B0
     STA $06F2,X
     INX
+    RTS
+
+; --------------------------------------------------------------------------
+; RESTORE_ZP — hand Applesoft's zero page back exactly as we found it.
+; Uses A/X only; must not touch $06-$37 before the copy completes.
+; --------------------------------------------------------------------------
+RESTORE_ZP:
+    LDX #$00
+RESTORE_ZP_LOOP:
+    LDA ZP_SAVE,X
+    STA $06,X
+    INX
+    CPX #$32
+    BNE RESTORE_ZP_LOOP
     RTS
 
 ; --------------------------------------------------------------------------
@@ -2010,45 +2288,53 @@ IRQ_DONE:
     RTI
 
 ; --------------------------------------------------------------------------
-; TICK — one VSYNC: normalize tick rate, consume one published frame
+; TICK — one VSYNC: consume the one frame the decoder published for it.
+; The decoder has already normalized the ZSM tick rate into 60 Hz frames, so
+; there is no rate gating here. The stopwatch counts IRQs, not consumed
+; frames (see TICK_NOFRAME), so T: stays locked to real time even when the
+; decoder is behind.
 ; --------------------------------------------------------------------------
 TICK:
+    LDA PAUSE
+    BEQ TICK_MCHK
+    JMP TICK_FREEZE           ; paused: no output, clock frozen
+TICK_MCHK:
     LDA MUTE
     BEQ TICK1
-    JMP TICK_DONE
+    JMP TICK_HOLD             ; muted: timeline keeps moving
 TICK1:
-    LDA PAUSE
-    BEQ TICK2
-    JMP TICK_DONE
-TICK2:
-    ; tick-rate accumulator: FRAC += TICKRATE; if >= 60 consume one frame
-    LDA FRAC
-    CLC
-    ADC TICKRATE
-    STA FRAC
-    CMP #60
-    BCS TICK3
-    JMP TICK_NOFRAME
-TICK3:
-    SEC
-    SBC #60
-    STA FRAC
     LDA FB_READY
     BNE TICK4
     JMP TICK_NOFRAME
 TICK4:
+    ; The published frame can be longer than 255 bytes (TITLE has a 128-pair
+    ; YM frame, GAMEOVER 213), so walk it with a 16-bit pointer: Y wraps at
+    ; 256 and carries into FB_RD_H. An 8-bit Y walk wrapped back into the
+    ; frame header and replayed it as YM/PSG data (audible noise).
+    LDA FB_ACT_L
+    STA FB_RD_L
+    LDA FB_ACT_H
+    STA FB_RD_H
     LDY #$00
-    LDA (FB_ACT_L),Y
+    LDA (FB_RD_L),Y
     CMP #$FF
     BEQ TICK_HOLD
     STA TCNT1
-    BEQ TICK_YM
+    CMP #$00              ; STA doesn't touch flags: re-test psgCnt itself.
+    BEQ TICK_YM           ; (leftover Z from CMP #$FF made psgCnt=0 fall through,
+                          ;  underflow TCNT1 to $FF and flood 256 bogus PSG pairs)
 TICK_PSG:
     INY
-    LDA (FB_ACT_L),Y       ; reg
+    BNE TICK_PSG_R
+    INC FB_RD_H
+TICK_PSG_R:
+    LDA (FB_RD_L),Y       ; reg
     TAX
     INY
-    LDA (FB_ACT_L),Y       ; val
+    BNE TICK_PSG_V
+    INC FB_RD_H
+TICK_PSG_V:
+    LDA (FB_RD_L),Y       ; val
     STA SHADOW,X
     TXA
     AND #$03
@@ -2076,34 +2362,46 @@ TICK_SEND:
     BNE TICK_PSG
 TICK_YM:
     INY
-    LDA (FB_ACT_L),Y       ; ymCnt
+    BNE TICK_YM_C
+    INC FB_RD_H
+TICK_YM_C:
+    LDA (FB_RD_L),Y       ; ymCnt
     STA TCNT2
     BEQ TICK_APPLY_DONE
 TICK_YML:
     INY
-    LDA (FB_ACT_L),Y       ; reg
+    BNE TICK_YML_R
+    INC FB_RD_H
+TICK_YML_R:
+    LDA (FB_RD_L),Y       ; reg
     STA YM_REG
     INY
-    LDA (FB_ACT_L),Y       ; val
+    BNE TICK_YML_V
+    INC FB_RD_H
+TICK_YML_V:
+    LDA (FB_RD_L),Y       ; val
     STA YM_DATA
     DEC TCNT2
     BNE TICK_YML
 TICK_APPLY_DONE:
     LDA #$00
     STA FB_READY
-    JMP TICK_BUMP
+    JMP TICK_CLK
 TICK_HOLD:
     LDA #$00
     STA FB_READY
-    JMP TICK_BUMP
+    JMP TICK_CLK
 TICK_NOFRAME:
+    ; No frame pending (decoder behind, or a rate < 60 hold already consumed):
+    ; the stopwatch still has to advance, else T: drifts behind the audio.
+    JMP TICK_CLK
+TICK_FREEZE:
+    ; Paused: consume the frame without applying it and leave the clock alone.
+    ; Clearing FB_READY keeps the publish handshake alive, so the main loop
+    ; still reaches its keyboard poll and P can resume playback.
+    LDA #$00
+    STA FB_READY
     RTS
-TICK_BUMP:
-    INC FRM0
-    BNE TICK_CLK
-    INC FRM1
-    BNE TICK_CLK
-    INC FRM2
 TICK_CLK:
     INC CLK_FRM
     LDA CLK_FRM
@@ -2174,6 +2472,7 @@ OPEN_STREAM:
 OPEN_PATH_OK:
     LDA #$00
     STA ERR
+    STA OPEN_PARAMS+5     ; slot/drive input (refnum output of the prior OPEN)
     LDA #$03
     STA OPEN_PARAMS
     JSR MLI
@@ -2402,10 +2701,18 @@ SILENCE_LOOP:
     RTS
 
 FM_KEY_OFF:
+    ; YM2151 $08: operator bits 6:3 = keys, channel bits 2:0. With no operator
+    ; bits set it keys off that channel, so all eight have to be written --
+    ; a single $08=$00 write only ever silenced channel 0.
     LDA #$08
     STA YM_REG
-    LDA #$00
+    LDX #$00
+FKO_LOOP:
+    TXA
     STA YM_DATA
+    INX
+    CPX #$08
+    BNE FKO_LOOP
     RTS
 
 RESTORE_ALL:
@@ -2645,6 +2952,173 @@ ROW_TBL:
     !word $0480,$04A8,$04D0,$04F8,$0520,$0548,$0570,$0598,$05C0,$05E8,$0610
 
 ; --------------------------------------------------------------------------
+; SHOW_INFO — song header: row 0 "MELODIUS  <category>", row 1 title
+; with the duration right-aligned, row 2 rule, rows 3-4 keyboard hints
+; (jukebox.hdv style: directly under the title). Row 23 is SHOW_STATUS.
+; Text rows are interleaved: row N = $0400 + (N & 7)*$80 + (N >> 3)*40,
+; so 21 = $06D0, 22 = $0750, 23 = $07D0 (not $0400 + N*40).
+; --------------------------------------------------------------------------
+SHOW_INFO:
+    LDA #$00
+    STA $C002
+    STA $C004
+    STA $C000
+    STA $C054
+    STA $C00C
+    STA $C051
+    STA $C052
+    STA $C056
+
+    LDY #$00
+SI_BRAND:
+    LDA INFO_BRAND,Y
+    BEQ SI_CAT
+    ORA #$80
+    STA $0400,Y
+    INY
+    BNE SI_BRAND
+SI_CAT:
+    JSR IS_EXTERNAL
+    BNE SI_TITLE
+    LDY #$00
+SI_CAT_L:
+    LDA INFO_CAT,Y
+    BEQ SI_TITLE
+    ORA #$80
+    STA $040A,Y
+    INY
+    CPY #28
+    BNE SI_CAT_L
+SI_TITLE:
+    JSR IS_EXTERNAL
+    BNE SI_TITLE_TABLE
+    LDA INFO_TITLE
+    BEQ SI_TITLE_NAME
+    LDA #<INFO_TITLE
+    STA NAME_PTR_L
+    LDA #>INFO_TITLE
+    STA NAME_PTR_H
+    JMP SI_TITLE_DRAW
+SI_TITLE_NAME:
+    ; no title poked by the menu: show the ProDOS name instead
+    LDA EXT_NAME
+    BEQ SI_DUR
+    LDA #<EXT_NAME
+    STA NAME_PTR_L
+    LDA #>EXT_NAME
+    STA NAME_PTR_H
+    JMP SI_TITLE_DRAW
+SI_TITLE_TABLE:
+    ; built-in menu: SONG_TITLES + SONG_NUM*32
+    LDA SONG_NUM
+    ASL A
+    ASL A
+    ASL A
+    ASL A
+    ASL A
+    CLC
+    ADC #<SONG_TITLES
+    STA NAME_PTR_L
+    LDA #>SONG_TITLES
+    ADC #$00
+    STA NAME_PTR_H
+SI_TITLE_DRAW:
+    LDY #$00
+SI_TITLE_L:
+    LDA (NAME_PTR_L),Y
+    BEQ SI_DUR
+    ORA #$80
+    STA $0480,Y
+    INY
+    CPY #40
+    BNE SI_TITLE_L
+SI_DUR:
+    ; Duration poked by the MELODIUS menu, right-aligned on the title row.
+    LDY #$00
+    LDA INFO_DUR
+    BEQ SI_RULE
+SI_DUR_LEN:
+    LDA INFO_DUR,Y
+    BEQ SI_DUR_GO
+    INY
+    CPY #16
+    BNE SI_DUR_LEN
+SI_DUR_GO:
+    LDX #39
+SI_DUR_W:
+    DEY
+    BMI SI_RULE
+    LDA INFO_DUR,Y
+    ORA #$80
+    STA $0480,X
+    DEX
+    BPL SI_DUR_W
+SI_RULE:
+    LDY #$00
+    LDA #$AD              ; '-'
+    ORA #$80
+SI_RULE_L:
+    STA $0500,Y
+    INY
+    CPY #40
+    BNE SI_RULE_L
+SI_CTRL1:
+    LDY #$00
+SI_CTRL1_L:
+    LDA INFO_CTRL1,Y
+    BEQ SI_CTRL2
+    ORA #$80
+    STA $0580,Y
+    INY
+    BNE SI_CTRL1_L
+SI_CTRL2:
+    LDY #$00
+SI_CTRL2_L:
+    LDA INFO_CTRL2,Y
+    BEQ SI_LOOP_TAG
+    ORA #$80
+    STA $0600,Y
+    INY
+    BNE SI_CTRL2_L
+SI_LOOP_TAG:
+    JSR SHOW_LOOP_TAG
+    RTS
+
+; SHOW_LOOP_TAG — overwrite the 3-char mode tag at the end of "L=LOOP:".
+SHOW_LOOP_TAG:
+    LDA LOOP_EN
+    BEQ SLT_OFF
+    LDA #$CF              ; 'O'
+    STA $0611
+    LDA #$CE              ; 'N'
+    STA $0612
+    LDA #$A0
+    STA $0613
+    RTS
+SLT_OFF:
+    LDA #$CF              ; 'O'
+    STA $0611
+    LDA #$C6              ; 'F'
+    STA $0612
+    LDA #$C6              ; 'F'
+    STA $0613
+    RTS
+
+; Z=1 when the caller is the MELODIUS BASIC menu (external-name mode).
+IS_EXTERNAL:
+    LDA EXT_MAGIC
+    CMP #$4D              ; 'M'
+    BNE IE_NO
+    LDA EXT_MAGIC+1
+    CMP #$5A              ; 'Z'
+    BNE IE_NO
+    LDA #$00
+    RTS
+IE_NO:
+    LDA #$01
+    RTS
+
+; --------------------------------------------------------------------------
 ; SHOW_STATUS — row 23 "T: mm:ss.s [16ch meter] V:xx"
 ; --------------------------------------------------------------------------
 SHOW_STATUS:
@@ -2725,7 +3199,15 @@ DIV6_FRM_DONE:
     TXA
     ORA #$B0
     STA $07D9
-    ; 16-ch meter
+    ; 16-ch meter, or the PCM sample cursor for a pure-PCM track
+    LDA PSGMASK_L
+    ORA PSGMASK_H
+    BNE METER_HAVE
+    LDA PCM_TBL_L
+    ORA PCM_TBL_M
+    ORA PCM_TBL_H
+    BNE SS_PCM_LINE
+METER_HAVE:
     LDA #$A0
     STA $07DA
     LDA #$DB              ; '['
@@ -2766,6 +3248,42 @@ METER_PUT:
     BNE METER_LOOP
     LDA #$DD              ; ']'
     STA $07EC
+    JMP SS_TAIL
+SS_PCM_LINE:
+    ; " PCM $xxxxxx" - the streaming cursor, so the status line tracks the audio
+    LDA #$A0
+    STA $07DA
+    LDA #$D0              ; 'P'
+    STA $07DB
+    LDA #$C3              ; 'C'
+    STA $07DC
+    LDA #$CD              ; 'M'
+    STA $07DD
+    LDA #$A0
+    STA $07DE
+    LDA #$A4              ; '$'
+    STA $07DF
+    LDA PCM_POS_H
+    JSR SS_HEX
+    STX $07E0
+    STA $07E1
+    LDA PCM_POS_M
+    JSR SS_HEX
+    STX $07E2
+    STA $07E3
+    LDA PCM_POS_L
+    JSR SS_HEX
+    STX $07E4
+    STA $07E5
+    LDA #$A0
+    STA $07E6
+    STA $07E7
+    STA $07E8
+    STA $07E9
+    STA $07EA
+    STA $07EB
+    STA $07EC
+SS_TAIL:
     ; V:xx
     LDA #$A0
     STA $07ED
@@ -2805,11 +3323,38 @@ SS_UNPAUSED:
     STA $07F7
     RTS
 
+; Split A into two screen-code hex digits: X = high nibble, A = low nibble.
+SS_HEX:
+    PHA
+    LSR
+    LSR
+    LSR
+    LSR
+    TAY
+    LDA HEX_DIGITS,Y
+    TAX
+    PLA
+    AND #$0F
+    TAY
+    LDA HEX_DIGITS,Y
+    RTS
+HEX_DIGITS:
+    !byte $B0,$B1,$B2,$B3,$B4,$B5,$B6,$B7,$B8,$B9,$C1,$C2,$C3,$C4,$C5,$C6
+
 ; --------------------------------------------------------------------------
 ; Strings
 ; --------------------------------------------------------------------------
 MENU_TITLE:
     ASC "ZSM JUKEBOX R1 FOR APPLE II          "
+    !byte 0
+INFO_BRAND:
+    ASC "MELODIUS  "
+    !byte 0
+INFO_CTRL1:
+    ASC "ESC=EXIT  P=PAUSE  M=MUTE  R=RESTART"
+    !byte 0
+INFO_CTRL2:
+    ASC "+/-=VOL  L=LOOP:     [/]=SEEK 5S"
     !byte 0
 MENU_CTRL:
     ASC "ESC/Q=EXIT  1-9,0=S  P=PAUSE  M=MUTE"
@@ -2911,6 +3456,14 @@ DONE_FLAG:
     !byte 0
 DEBUG_MARKER:
     !byte 0
+TICKS_PER_FRM:
+    !byte 1              ; whole ZSM ticks folded into one 60 Hz frame
+TICK_REM:
+    !byte 0              ; leftover tick rate fraction (sixtieths)
+TICKS_LEFT:
+    !byte 0              ; source ticks still to decode in this frame
+FRAME_PUB:
+    !byte 0              ; DECODE_ONE_TICK already published the frame
 OLD_L:
     !byte 0
 OLD_H:
@@ -2934,6 +3487,8 @@ STREAM_END:
 EOF_FLAG:
     !byte 0
 SONG_NUM:
+    !byte 0
+EXT_PLAYED:
     !byte 0
 TCNT1:
     !byte 0
@@ -2969,7 +3524,7 @@ READ_PARAMS:
 CLOSE_PARAMS:
     !byte 1,0
 SETMARK_PARAMS:
-    !byte 4,0,0,0,0
+    !byte 2,0,0,0,0
 REF_NUM:
     !byte 0
 SHORT_READ:
@@ -2995,8 +3550,6 @@ PCM_DATA_BASE_H:
     !byte 0
 PCM_INST:
     !byte 0
-PCM_LOADED:
-    !byte $FF
 PCM_ENTRY:
     !byte 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 PCM_OFF_L:
@@ -3035,19 +3588,17 @@ PCM_RATE:
     !byte 0
 PCM_EFFRATE:
     !byte 0
-PCM_BUDGET_L:
-    !byte 0
-PCM_BUDGET_H:
-    !byte 0
+PP_QUOTA:
+    !byte 0        ; bytes to push in the current PCM_FEED pass (<=128)
+PP_TMPY:
+    !byte 0        ; Y saved for the per-pass bookkeeping
+PP_PASSES:
+    !byte 0        ; passes left in the current PCM_FEED call
 PCM_POS_L:
     !byte 0
 PCM_POS_M:
     !byte 0
 PCM_POS_H:
-    !byte 0
-PCM_FED_L:
-    !byte 0
-PCM_FED_H:
     !byte 0
 PCM_ACTIVE:
     !byte 0
@@ -3060,25 +3611,25 @@ PCM_EVCOUNT:
 PCM_TMP:
     !byte 0
     !byte 0        ; PCM_TMP+1
-PCM_DST_L:
-    !byte 0
-PCM_DST_H:
-    !byte 0
 PCM_COUNT_L:
     !byte 0
 PCM_COUNT_M:
     !byte 0
 PCM_COUNT_H:
     !byte 0
-PCM_CHUNK_L:
+PCM_FPOS_L:
     !byte 0
-PCM_CHUNK_H:
+PCM_FPOS_M:
+    !byte 0
+PCM_FPOS_H:
+    !byte 0
+PP_LEFT_L:
+    !byte 0        ; bytes of the staged window still unfed (16-bit)
+PP_LEFT_H:
     !byte 0
 PCM_REF:
     !byte 0
-PCM_FP_ADDR_L:
-    !byte 0
-PCM_FP_ADDR_H:
+PCM_IOERR:
     !byte 0
 ERRSRC:
     !byte 0

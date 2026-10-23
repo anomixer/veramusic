@@ -116,6 +116,8 @@ static void ym_generate(int16_t *l, int16_t *r) {
   ymif.m_clockCount += 64; // one native output sample = 64 chip clocks
 }
 
+static void ym_clock_keyoff(void);
+
 // ---------------------------------------------------------------------------
 // ZSM stream decode (mirrors tools/zsm2psg.mjs)
 // ---------------------------------------------------------------------------
@@ -467,13 +469,15 @@ static bool load_zcm_file(const char *filename) {
 // Player state
 // ---------------------------------------------------------------------------
 static int currentFrame = 0;
-static int masterVolume = 12; // 0..15
-// Hardware-accurate mix gains. VERACard.cpp sums the VERA PSG and the YM2151
-// daughterboard 1:1 (`mixed = psg + ym`), so all three engines default to 1.0
-// and the balance between them matches the real Apple II / X16 output.
+static int masterVolume = 15; // 0..15 (full scale; the linear mix peaks below 1.0)
+// Hardware-accurate mix gains, following the X16 Developer Board mixer:
+//   mix = (PSG + PCM) * 2 + YM
+// (x16-emulator audio.c: `(psg + pcm) << 14 >> 13` + `ym >> 15`; a single
+// full-volume PSG voice is 1/8 of the output). Mixing PSG/PCM 1:1 buries the
+// PSG under the YM2151, which is far louder than a PSG voice.
 static double fmGain = 1.0;   // FM (YM2151) mix gain
-static double pcmGain = 1.0;  // VERA PCM mix gain (F5/F6)
-static double psgGain = 1.0;  // VERA PSG mix gain (F3/F4)
+static double pcmGain = 2.0;  // VERA PCM mix gain (F5/F6)
+static double psgGain = 2.0;  // VERA PSG mix gain (F3/F4)
 static bool isMuted = false;
 static bool isPaused = false;
 static bool isRunning = true;
@@ -519,6 +523,13 @@ static void apply_frame(int frameIdx) {
     }
     ym2151->write(0, reg); // register select
     ym2151->write(1, val); // data
+    // A tick's writes are applied back-to-back, so a key-off immediately
+    // followed by a key-on (the ZSM retrigger idiom) would never be seen by
+    // ymfm's sample-clocked keystate sampler: the key state stays "on" and
+    // the envelope keeps decaying instead of restarting. Clock one native
+    // sample so the chip latches the release before the key-on arrives.
+    if (reg == 0x08 && (val & 0x78) == 0)
+      ym_clock_keyoff();
   }
   for (size_t i = 0; i < f.pcm.size(); i++)
     pcm_apply_event(f.pcm[i]);
@@ -542,7 +553,7 @@ static void seek_frame(int targetFrame) {
     const int effRate = (pcmRateByte > 128) ? (256 - pcmRateByte) : pcmRateByte;
     if (effRate > 0) {
       const double pcmHz = (double)effRate * (48828.125 / 128.0);
-      const double samples = (double)(targetFrame - pcmTriggerTick) * pcmHz / 60.0;
+      const double samples = (double)(targetFrame - pcmTriggerTick) * pcmHz / (double)tickRate;
       const int bytesPerSample = ((pcmFormat & 1) ? 2 : 1) * ((pcmFormat & 2) ? 2 : 1);
       double pos = samples * (double)bytesPerSample;
       const PcmInst &inst = pcmInsts[pcmInstIdx];
@@ -569,6 +580,12 @@ static void seek_frame(int targetFrame) {
 static double resamplePosPsg = 0.0; // not used; PSG renders at SAMPLE_RATE directly
 static double ymPhase = 0.0;
 static int16_t ymPrevL = 0, ymPrevR = 0, ymCurL = 0, ymCurR = 0;
+
+static void ym_clock_keyoff(void) {
+  ymPrevL = ymCurL;
+  ymPrevR = ymCurR;
+  ym_generate(&ymCurL, &ymCurR);
+}
 
 static void ym_render_sample(int16_t *l, int16_t *r) {
   const double nativeRate = (double)ym2151->sample_rate(3579545);
@@ -675,10 +692,9 @@ static void render_frame(int16_t *outBuffer) {
       sv = (sv << 16) >> 16;
 
       // Hardware voice level: every voice is attenuated by 3 bits, so one
-      // voice at full volume is ~1980/32767 and all 16 sum to just under full
-      // scale (VERAAudio.cpp: l += (sv * volume) >> 3). Treating one voice as
-      // full scale made the PSG ~16x too loud, which pinned the tanh limiter
-      // and buried the YM2151 percussion.
+      // full-volume voice is 1/8 of full scale (VERAAudio.cpp: l +=
+      // (sv * volume) >> 3). The Developer Board's mixer compensates by
+      // doubling the PSG/PCM bus (psgGain/pcmGain default 2.0).
       const float voiceSig =
           (float)sv * (float)volumeLut[volIdx] * (1.0f / 262144.0f);
 
@@ -762,14 +778,12 @@ static void render_frame(int16_t *outBuffer) {
     mixL *= effVol;
     mixR *= effVol;
 
-    // Soft analog-style tanh saturation. With hardware-accurate engine levels
-    // a busy 8-channel FM arrangement peaks near 0.9, so a 2.0x drive keeps
-    // the mix loud while leaving headroom for percussion transients.
-    float satL = tanhf(mixL * 2.0f);
-    float satR = tanhf(mixR * 2.0f);
-
-    int32_t valL = (int32_t)(satL * 30000.0f);
-    int32_t valR = (int32_t)(satR * 30000.0f);
+    // Hardware output stage: VERA and the YM2151 are summed linearly and the
+    // DAC hard-clips, so no soft limiter here. A tanh saturator used to duck
+    // the whole mix (PSG included) at every loud FM attack, and the PSG is
+    // quiet enough that it sounded like it was breaking up.
+    int32_t valL = (int32_t)(mixL * 32768.0f);
+    int32_t valR = (int32_t)(mixR * 32768.0f);
 
     if (valL > 32767) valL = 32767;
     if (valL < -32767) valL = -32767;
@@ -808,12 +822,12 @@ static char pcmSymbol(int level) {
   return '^';
 }
 
-static void draw_ui(const char *title) {
-  int curSec = currentFrame / 60;
+static void draw_ui() {
+  int curSec = currentFrame / tickRate;
   int curMin = curSec / 60;
   curSec %= 60;
 
-  int totSec = totalFrames / 60;
+  int totSec = totalFrames / tickRate;
   int totMin = totSec / 60;
   totSec %= 60;
 
@@ -831,36 +845,33 @@ static void draw_ui(const char *title) {
   }
   progBar[16] = '\0';
 
-  char chBar[20];
-  if (fmMask != 0) {
-    // FM+PSG track: slots 0-7 = YM2151 channels (key-on), slots 8-15 = PSG voices 0-7
-    for (int i = 0; i < 8; i++)
-      chBar[i] = fmKeyOn[i] ? '^' : '.';
-    for (int i = 0; i < 8; i++) {
-      uint8_t v = channelVols[i];
-      chBar[8 + i] = (v == 0) ? '.' : (v < 15) ? '-' : (v < 35) ? '=' : (v < 50) ? '#' : '^';
-    }
-  } else {
-    // Pure PSG track: 16 voices
-    for (int i = 0; i < 16; i++) {
-      uint8_t v = channelVols[i];
-      chBar[i] = (v == 0) ? '.' : (v < 15) ? '-' : (v < 35) ? '=' : (v < 50) ? '#' : '^';
-    }
+  // Three independent meters: FM key-on (8), PSG voice volume (16), PCM L/R.
+  char fmBar[9];
+  for (int i = 0; i < 8; i++)
+    fmBar[i] = fmKeyOn[i] ? '^' : '.';
+  fmBar[8] = '\0';
+
+  char psgBar[17];
+  for (int i = 0; i < 16; i++) {
+    uint8_t v = channelVols[i];
+    psgBar[i] = (v == 0) ? '.' : (v < 15) ? '-' : (v < 35) ? '=' : (v < 50) ? '#' : '^';
   }
-  // Slots 16-17: VERA PCM L/R output level (peak sample, 0..32767)
-  chBar[16] = pcmSymbol(pcmPeakL);
-  chBar[17] = pcmSymbol(pcmPeakR);
-  chBar[18] = '\0';
+  psgBar[16] = '\0';
+
+  char pcmBar[3];
+  pcmBar[0] = pcmSymbol(pcmPeakL);
+  pcmBar[1] = pcmSymbol(pcmPeakR);
+  pcmBar[2] = '\0';
 
   const char *statusStr =
       isPaused ? "PAUS"
                : (isMuted ? "MUTE" : (loopEnabled ? (hasLoop ? "LOOP" : "REPT") : "1SHT"));
 
   char line[256];
-  snprintf(line, sizeof(line), "[%-12.12s] %02d:%02d/%02d:%02d [%s] [%s] V:%02d FM:%.2f PSG:%.2f PCM:%.2f [%s]",
-           title, curMin, curSec, totMin, totSec, progBar, chBar, masterVolume,
+  snprintf(line, sizeof(line), "%02d:%02d/%02d:%02d [%s] [FM %s] [PSG %s] [PCM %s] V:%02d FM:%.2f PSG:%.2f PCM:%.2f [%s]",
+           curMin, curSec, totMin, totSec, progBar, fmBar, psgBar, pcmBar, masterVolume,
            fmGain, psgGain, pcmGain, statusStr);
-  printf("\r%-110s", line);
+  printf("\r%-118s", line);
   fflush(stdout);
 }
 
@@ -904,7 +915,7 @@ int main(int argc, char **argv) {
     printf("========================================================\n");
     printf("Usage:\n");
     printf("  melodius.exe <file.zsm|.zcm> [--no-loop] [--vol 0..15] [--fmvol 0.25..16] [--psgvol 0.25..16] [--pcmvol 0.25..16] [--time N] [--wav out.wav]\n\n");
-    printf("  Engine gains default to 1.0 (hardware-accurate VERA PSG / YM2151 mix);\n");
+    printf("  Engine gains default to the X16 Developer Board mix: (PSG+PCM)*2 + YM;\n");
     printf("  use --fmvol/--psgvol/--pcmvol (or F1..F6) to rebalance.\n");
     printf("  --wav renders the whole song offline to a 48 kHz stereo WAV and exits.\n");
     printf("  (.mid playback is not included in this build)\n\n");
@@ -978,7 +989,11 @@ int main(int argc, char **argv) {
     // Canonical 44-byte WAV header: RIFF/WAVE + 16-byte fmt chunk
     // (audioFormat, channels, sampleRate, byteRate, blockAlign, bitsPerSample)
     // + data chunk.
-    const uint32_t dataBytes = (uint32_t)(totalFrames * SAMPLES_PER_FRAME * 4);
+    // totalFrames counts stream ticks at tickRate; the render loop consumes
+    // tickRate/60 ticks per 60 Hz output frame, so the WAV holds
+    // totalFrames*60/tickRate frames (ceil so the last tick is not dropped).
+    const int outFrames = (int)(((int64_t)totalFrames * FPS + tickRate - 1) / tickRate);
+    const uint32_t dataBytes = (uint32_t)((int64_t)outFrames * SAMPLES_PER_FRAME * 4);
     const uint16_t fmtSize = 16, audioFormat = WAVE_FORMAT_PCM;
     const uint16_t chn = 2, bits = 16, blkAlign = 4;
     const uint32_t rate = SAMPLE_RATE, byteRate = rate * blkAlign;
@@ -998,13 +1013,13 @@ int main(int argc, char **argv) {
     fwrite(&dataBytes, 4, 1, w);
 
     std::vector<int16_t> frameBuf(SAMPLES_PER_FRAME * 2);
-    for (int f = 0; f < totalFrames; f++) {
+    for (int f = 0; f < outFrames; f++) {
       render_frame(frameBuf.data());
       fwrite(frameBuf.data(), 2, frameBuf.size(), w);
     }
     fclose(w);
     printf("Wrote %s (%d frames, %.1fs, FM:%.2f PSG:%.2f PCM:%.2f)\n", wavOutPath,
-           totalFrames, totalFrames / 60.0, fmGain, psgGain, pcmGain);
+           outFrames, (double)outFrames / FPS, fmGain, psgGain, pcmGain);
     return 0;
   }
 
@@ -1052,8 +1067,8 @@ int main(int argc, char **argv) {
 
   printf("============================================================================================================\n");
   printf(" Melodius (YM2151 + VERA PSG + VERA PCM) -- %s\n", baseName);
-  printf(" Frames: %d (%.1fs) | Loop Frame: %d | Stream: %zu bytes\n", totalFrames,
-         totalFrames / 60.0, loopFrame, streamSize);
+  printf(" Ticks: %d (%.1fs) | Loop Tick: %d | Stream: %zu bytes\n", totalFrames,
+         totalFrames / (double)tickRate, loopFrame, streamSize);
   if (!pcmInsts.empty()) {
     printf(" PCM: %d instrument(s)%s\n", (int)pcmInsts.size(),
            pcmInsts[0].looped ? " (looped)" : "");
@@ -1124,7 +1139,7 @@ int main(int argc, char **argv) {
     now = GetTickCount();
     DWORD uiInterval = isRealConsole ? 50 : 500;
     if (now - lastUiTick >= uiInterval) {
-      draw_ui(baseName);
+      draw_ui();
       lastUiTick = now;
     }
 
