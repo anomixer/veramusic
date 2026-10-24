@@ -926,3 +926,18 @@ Song order: 0 Title, 1 Level 1, 2 Level 2, 3 Level 2 Alt, 4 Level 3, 5 Level 4, 
   integration does not add a dependency to `veramusic`.
 - Rebuilt `tools/ftmplay.exe` with `tools\build_ftmplay.bat`. The altered
   Level 2 `.psg` renders through `psgplay.exe --wav` as 2,589 frames / 43.1 s.
+
+### Milestone 46: ZSM → VZM export path for `veratest` (A2VERA stream format) (2026-10-24)
+
+- `veramusic` keeps the Commander X16 `.ZSM` tracks as the source of truth, and its own Apple //e player (`src/zsmstream.asm`, the `melodius.hdv` jukebox) reads them **directly**, tick-rate normalised from the header.
+- The sibling [`veratest`](https://github.com/anomixer/veratest) repository reuses three of those tracks (`SB-INTRO`, `CANYON`, `GREENHILL`) in its 140 KB demo disk and 32 MB slideshow. Its players are too small to carry a ZSM parser, so `veratest`'s build (`src/zsm2vera.mjs`) converts each `.ZSM` into **VZM** — "VERA ZSM", an A2VERA-oriented derivative rather than a second encoder. The music is the same: every PSG write and every YM2151 write is re-packed in original order, so the daughterboard receives what the tracker emitted.
+- VZM record layout (no header; length comes from the ProDOS file size):
+  - `$00..$7F` delay — byte `N` adds `N` further ticks; a ZSM delay of `D` ticks is stored as `D - 1`.
+  - `$80..$BF` PSG write — register `= byte & $3F` (`$1F9C0 + reg`), followed by 1 value byte.
+  - `$C0..$DF` YM2151 batch — pair count `= (byte & $1F) + 1`, followed by `count` × (register, value).
+  - `$E0..$FE` block padding (records never straddle a 512-byte ProDOS block); `$FF` ends the stream and the player loops from offset 0.
+- Why the indirection: no ZSM parser in the 6502 player, YM2151 address/data pairs pre-batched, the PSG and FM halves separated so a card without the FM chip skips the FM records with one branch, per-track mix curves (CANYON's percussion/melody balance) baked into the stream, and duplicate register writes dropped.
+- The YM2151 key register `$08` is copied **verbatim** and never de-duplicated: operator mask in bits 6..3, channel in bits 2..0, bit 7 ignored, and a zero mask releases the operators. This matches `tools/zsm2psg.mjs` and ymfm (`ymfm_opm.cpp`: `channel = bitfield(data,0,3); opmask = bitfield(data,3,4)`). Rewriting it into a bit-7 key flag turns every key-off into a key-on, so each FM channel sounds once, decays, and never retriggers — this was a real bug fixed in `veratest` on the same day.
+- Provenance of the shipped streams: 0 mismatched ticks out of 31,147 across the three tracks (`SB-INTRO` 20,385 / `CANYON` 7,570 / `GREENHILL` 3,192), verified by `veratest`'s `node src/verify_music_streams.mjs`, which rebuilds the streams, diffs them against the packaged `.vzm` files and replays both the raw ZSM and the converted stream register-image by register-image.
+- Sizes: `SB-INTRO` 346,425 B → 347,136 B (678 blocks), `CANYON` 129,168 B → 124,416 B (243), `GREENHILL` 22,337 B → 18,432 B (36). Raw `GREENHILL.ZSM` would need 44 blocks, which does not fit the demo floppy's remaining 4; the 32 MB slideshow would fit either.
+- `veratest` documents the format in its `AGENTS.md` §4.4 and `README.md` ("The VZM Stream Format (ZSM → A2VERA)"); the players are `src/slideshow/slideshow.asm` and `src/veratest/sonic.asm`. `veramusic` itself is unchanged by this milestone — it remains the ZSM producer and the direct-ZSM reference player.

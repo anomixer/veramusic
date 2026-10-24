@@ -98,6 +98,49 @@ AppleWin.exe -s2 vera -s7 hdc -h1 melodius.hdv -power-on
 
 ---
 
+## ZSM → VZM: Apple II Demo Streams for `veratest`
+
+This repository keeps the Commander X16 `.ZSM` tracks as the source of truth, and
+`src/zsmstream.asm` plays them directly on the Apple //e. The sibling
+[`veratest`](https://github.com/anomixer/veratest) repository ships three of
+them (`SB-INTRO`, `CANYON`, `GREENHILL`), but its demo and slideshow players are
+too small to carry a ZSM decoder — so `veratest`'s build converts those tracks
+into **VZM**, a byte-oriented derivative tuned for the Apple II + VERA case
+("A2VERA"). VZM is not a second encoder: it is a re-packing of the same ZSM
+writes, one record per tick, so the YM2151 arrangement from the tracker still
+reaches the daughterboard.
+
+| Leading byte | Meaning | Followed by |
+| :--- | :--- | :--- |
+| `$00..$7F` | Delay: byte `N` adds `N` further ticks (a ZSM delay of `D` is stored as `D - 1`) | — |
+| `$80..$BF` | PSG register write, register `= byte & $3F` | 1 byte value |
+| `$C0..$DF` | YM2151 batch, pair count `= (byte & $1F) + 1` | `count` × (register, value) |
+| `$E0..$FE` | Padding to keep records inside one 512-byte block | — |
+| `$FF` | End of stream (the player loops from offset 0) | — |
+
+There is no VZM header; the length comes from the ProDOS file size. The
+YM2151 key register `$08` is copied verbatim and never de-duplicated — it is an
+operator mask in bits 6..3 plus the channel in bits 2..0, and mask 0 releases
+the operators. This is the same convention `tools/zsm2psg.mjs` and ymfm use, and
+rewriting it (for example treating bit 7 as a key flag) makes every key-off
+become a key-on, so each FM channel sounds once and then decays forever.
+
+| Track | `.ZSM` | VZM | ProDOS blocks |
+| :--- | ---: | ---: | ---: |
+| `SB-INTRO` | 346,425 B | 347,136 B | 678 |
+| `CANYON` | 129,168 B | 124,416 B | 243 |
+| `GREENHILL` | 22,337 B | 18,432 B | 36 |
+
+The conversion and players live in `veratest` (`src/zsm2vera.mjs`,
+`src/music_streams.mjs`, `src/slideshow/slideshow.asm`, `src/veratest/sonic.asm`);
+`veratest`'s `node src/verify_music_streams.mjs` replays both sides tick by tick
+and reports 0 mismatched ticks across the 31,147 ticks of the three tracks, and
+`veratest/AGENTS.md` §4.4 documents the format. The raw `.ZSM` stays on the
+`melodius.hdv` jukebox, where 6502 RAM and disk budget are not as tight
+(`GREENHILL.ZSM` alone is 44 blocks against 36 for its VZM).
+
+---
+
 ## Repository Structure
 
 ```text
