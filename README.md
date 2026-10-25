@@ -53,7 +53,7 @@ Tested on:
   - **Tick-rate normalization** follows zsmkit: the decoder folds `tickRate/60` stream ticks (plus a carried remainder) into each 60 Hz output frame, so non-60 Hz files play at tempo — Headbanger at 240 ticks/s used to run 4× slow — and rates below 60 publish hold frames. The frame counter tracks source ticks, so the 5 s seek keys scale with the file's tick rate.
   - Two-level jukebox menu (17 composer/furniture categories → songs) over **94 ZSM tracks** on a 32 MB hard disk (`melodius.hdv`), mirroring the layout of `jukebox.hdv`.
   - In-song header in the jukebox style: brand + category on row 0, the title with its `(m:ss)` length right-aligned on row 1, a 40-column dash rule, then two control lines with a live `L=LOOP: ON/OFF` tag; the status line (time / seek bar / volume) stays on row 23. Durations are **ticks ÷ the header tick rate** (11 of the 94 files are not 60 Hz: Headbanger 4:24 rather than 17:34, BlankPage 9:09 rather than the 9:46 `melodius.exe` used to print).
-  - PCM samples are streamed from a companion `<name>.PCM` file (ProDOS 8 refuses a second OPEN on an already-open file, so the build step splits the ZSM's PCM table out) in a single **4 KB window** (`$4400-$53FF`) that holds a whole drum sample, and the window is **reused in place** when a trigger asks for the same file position and length — `PCM_FILL_WINDOW` compares against `PCM_CPOS`/`PCM_CLEN` and skips the MLI call, so a repeated drum costs no disk read. Combined with the 6-slot published-frame ring (`$7300-$7EFF`, 5 frames of lookahead) this took Crockett from 10.44 % dropped ticks to **0.18 %** (59.86 fps) with no FIFO underrun.
+  - PCM samples are streamed from a companion `<name>.PCM` file (ProDOS 8 refuses a second OPEN on an already-open file, so the build step splits the ZSM's PCM table out) in a single **4 KB window** (`$4400-$53FF`) that holds a whole drum sample, and the window is **reused in place** when a trigger asks for the same file position and length — `PCM_FILL_WINDOW` compares against `PCM_CPOS`/`PCM_CLEN` and skips the MLI call, so a repeated drum costs no disk read. Combined with the **8-slot** published-frame ring (`$6F00-$7EFF`, 7 frames of lookahead), a status line redrawn 7 times a second instead of once per decoded frame, and a PCM feed that only writes when the FIFO is low (`VERA_ISR` bit 3, AFLOW) this took Crockett from 10.44 % dropped ticks to **0.05 %** and the 9-minute Crisps track `BLANKPAGE` from 2.30 % to **0** (60.16 fps), with no FIFO underrun.
   - PCM samples are **decimated at build time** by `tools/zsm_pcm_resample.mjs` to the jukebox's proven 8 kHz (**VERA rate 21**), with 16-bit instruments re-quantized to dithered 8-bit: every rate event is scaled and the sample data area-decimated by the inverse, so pitch and duration are preserved. Mono songs cost **8,011 B/s** of FIFO, the five stereo ones 16,022 B/s, and all 28 PCM songs play glitch-free on a 1.02 MHz //e. Companions shrink accordingly (`PCM01.PCM` 1.47 MB → 423 KB, `MOO03.PCM` 6.8 KB).
   - Dual-slot binaries (`src/MELODIUS.BIN` slot 2, `src/MELODIUS4.BIN` slot 4); `node tools/build_melodius.mjs --autoplay <idx>` produces a temp auto-play image for headless verification, `--list` prints the song index table.
 - **Universal Player Controls Across All Formats**:
@@ -96,20 +96,25 @@ files decimated to 8 kHz. Boot it with:
 AppleWin.exe -s2 vera -s7 hdc -h1 melodius.hdv -power-on
 ```
 
-The engine was retuned for stutter at 1.02 MHz (see `AGENTS.md` Milestone 47):
-the published-frame ring is **6 slots** at `$7300-$7EFF` (5 frames of lookahead;
-`YM_SCRATCH` moved to `$5400` to make room), PCM uses a single **4 KB window** at
-`$4400-$53FF` that holds a whole drum sample, and `PCM_FILL_WINDOW` reuses the
-window still in memory when a trigger asks for the same file position and
-length, so a repeated drum never re-reads the disk. Measured on Crockett
-(`MOO03.ZSM` + `MOO03.PCM`, AppleWin 40 M cycles at 1.02 MHz): dropped ticks
+The engine was retuned for stutter at 1.02 MHz (see `AGENTS.md` Milestones 47
+and 48): the published-frame ring is **8 slots** at `$6F00-$7EFF` (7 frames of
+lookahead), PCM uses a single **4 KB window** at `$4400-$53FF` that holds a
+whole drum sample, and `PCM_FILL_WINDOW` reuses the window still in memory when
+a trigger asks for the same file position and length, so a repeated drum never
+re-reads the disk. The FIFO feed polls the VERA interrupt-status bit AFLOW
+instead of the FIFO once per byte and pushes 128 bytes in unrolled blocks,
+which cut it from 18 % of the CPU to 9 % and removed the last sustained
+overrun. Measured in AppleWin at 40 M cycles (1.02 MHz): dropped ticks
 **230 / 2203 (10.44 %)** in the original player → **88 (3.99 %)** with the
-6-slot ring → **49 (2.22 %)** with the 4 KB window → **4 (0.18 %, 59.86 fps)**
-with the window cache; the FM-dense `X16ROBOTS MAIN` measures **0** dropped
-ticks at 60.08 fps. Audio was checked from `-fm-wav-dump` (clicks / maximum
-slope / HF ratio): the shipped image measures 2 clicks per 20 s and hfRatio
-0.146, against 0.382 for the FIFO-underrun build that produced the audible
-grain. All 94 songs and both menu levels are unchanged.
+6-slot ring → **49 (2.22 %)** with the 4 KB window → **4 (0.18 %)** with the
+window cache → **1 (0.05 %)** with 8 slots and the AFLOW feed; the 9-minute
+Crisps track `BLANKPAGE` **52 (2.30 %) → 0**, 60.16 fps; the FM-dense
+`X16ROBOTS MAIN` stays **0** at 60.14 fps. Audio was checked from
+`-fm-wav-dump`: no zero run ≥ 1 ms and no quiet window over 20 s, peak and
+gain-matched envelope correlation 1.000 against the Milestone 47 build (lag
+drift 0 windows, tempo ratio 1.0000), against 0.382 hfRatio for the
+FIFO-underrun build that produced the audible grain. All 94 songs and both
+menu levels are unchanged.
 
 `node tools/update_melodius_player.mjs` refreshes the player inside an existing
 image (assemble both slots, `REPLACEFILE`, then volume/catalog/byte round-trip

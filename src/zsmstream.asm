@@ -118,10 +118,10 @@ PCM_PTR_H = $04
 
 BUF_LO  = $4000      ; 512-byte stream block buffer
 BUF_HI  = $4200
-FB_RING = $7300      ; 5 x 512 B published-frame ring ($73/$75/$77/$79/$7B xx00)
-FB_RING_H0 = $73     ; high byte of slot 0; slot n is at (FB_RING_H0 + 2*n)*$100
-FB_SLOTS = 6
-FB_MAX  = 5          ; published frames allowed: one ring slot is the writer's
+FB_RING = $6F00      ; 8 x 512 B published-frame ring ($6F/$71/$73/$75/$77/$79/$7B/$7D xx00)
+FB_RING_H0 = $6F     ; high byte of slot 0; slot n is at (FB_RING_H0 + 2*n)*$100
+FB_SLOTS = 8
+FB_MAX  = 7          ; published frames allowed: one ring slot is the writer's
 YM_SCRATCH = $5400   ; YM pair accumulation buffer (512 B)  -- free block above PCM_BUFFER2
 FILE_BUF = $6000
 PCM_BUFFER = $4400   ; PCM window (4096 B, $4400-$53FF) -- streamed from disk
@@ -320,7 +320,7 @@ POF2_OK:
     STA FB_HEAD
     STA FB_TAIL
     STA WRB_BASE_L
-    LDA #$73              ; ring slot 0 high byte
+    LDA #FB_RING_H0       ; ring slot 0 high byte
     STA WRB_BASE_H
     ; Prefill 1 frame (IRQ not hooked yet; IRQ_ACTIVE=0 -> publish no-wait)
     JSR DECODE_FRAME
@@ -334,7 +334,12 @@ MAIN:
     LDA ERR
     BNE DISK_FAIL_JMP
     JSR DECODE_FRAME
+    INC ST_DIV            ; the status line is a display: redraw it about
+    LDA ST_DIV            ; 7 times a second, not once per decoded frame
+    AND #$07
+    BNE ST_SKIP
     JSR SHOW_STATUS
+ST_SKIP:
     ; Keyboard
     LDA KBD_DATA
     BPL MAIN
@@ -1970,34 +1975,66 @@ PCM_FEED:
     BNE PF_NO                 ; frozen clock: don't queue audio behind the pause
     LDA PCM_ACTIVE
     BEQ PF_NO
-    JSR PCM_PRE_STEP          ; stage the next window in halves, ahead of need
+    ; VERA_ISR bit 3 is AFLOW: the FIFO holds fewer than 1024 bytes, so it
+    ; has at least 3072 free and a 384-byte burst cannot overrun. That is
+    ; what lets the loop write without polling the FIFO once per byte: 23
+    ; cycles/byte was 8 KB/s of FIFO at 18 % of the CPU, and on BlankPage
+    ; that alone pushed the decode loop past one frame (dropped ticks).
+    LDA VERA_ISR
+    AND #$08
+    BEQ PF_NO
     LDA #$03
-    STA PP_PASSES             ; at most 3 x 128 = 384 bytes per call: a bounded
-                              ; burst (~0.5 frame) instead of a 1 KB stall; the
-                              ; frame ring absorbs what is left
+    STA PP_PASSES             ; up to 3 x 128 bytes per call: one window in 11
 PF_PASS:
     LDA PP_LEFT_L
     ORA PP_LEFT_H
-    BEQ PF_WINDOW_OUT
-    ; quota = min(PP_LEFT, 128)
+    BNE PF_HAVE_LEFT
+    JMP PF_WINDOW_OUT
+PF_HAVE_LEFT:
     LDA PP_LEFT_H
-    BNE PF_QUOTA128
+    BNE PF_BLOCK
     LDA PP_LEFT_L
     CMP #$80
-    BCC PF_QUOTA_SET
-PF_QUOTA128:
-    LDA #$80
-PF_QUOTA_SET:
-    STA PP_QUOTA
+    BCS PF_BLOCK
+    ; fewer than 128 bytes left in the window: drain them one by one
     LDY #$00
-PF_LOOP:
-    LDA VERA_AUDIO_CTRL       ; bit 7 = FIFO full
-    BMI PF_FED
+PF_TAIL:
     LDA (PCM_PTR_L),Y
     STA VERA_AUDIO_DATA
     INY
-    CPY PP_QUOTA
-    BNE PF_LOOP
+    CPY PP_LEFT_L
+    BNE PF_TAIL
+    JMP PF_FED
+PF_BLOCK:
+    LDY #$00
+    LDX #$10                  ; 16 blocks of 8 bytes = 128
+PF_BLOCK_LOOP:
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    LDA (PCM_PTR_L),Y
+    STA VERA_AUDIO_DATA
+    INY
+    DEX
+    BNE PF_BLOCK_LOOP
 PF_FED:
     ; Y = bytes pushed this pass
     TYA
@@ -2029,13 +2066,11 @@ PF_PTR_DONE:
     LDA PCM_POS_H
     ADC #$00
     STA PCM_POS_H
-    ; a short pass means the FIFO was full: resume on the next call
-    TYA
-    CMP PP_QUOTA
-    BCC PF_RTS
     DEC PP_PASSES
-    BNE PF_PASS
+    BNE PF_MORE
     RTS
+PF_MORE:
+    JMP PF_PASS
 PF_RTS:
     RTS
 
@@ -4036,8 +4071,6 @@ PCM_RATE:
     !byte 0
 PCM_EFFRATE:
     !byte 0
-PP_QUOTA:
-    !byte 0        ; bytes to push in the current PCM_FEED pass (<=128)
 PP_TMPY:
     !byte 0        ; Y saved for the per-pass bookkeeping
 PP_PASSES:
@@ -4105,6 +4138,8 @@ PP_LEFT_L:
     !byte 0        ; bytes of the staged window still unfed (16-bit)
 PP_LEFT_H:
     !byte 0
+ST_DIV:
+    !byte 0        ; status redraw divider (display only)
 PCM_REF:
     !byte 0
 PCM_IOERR:
