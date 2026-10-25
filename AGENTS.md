@@ -777,8 +777,9 @@ To make MIDI piano on VERA PSG sound substantially more authentic ("原汁原味
 | `melodius.exe` | Win32 C++ (x86) | Native Windows Commander X16 music player (VERA PSG + YM2151 FM via ymfm + VERA PCM, WinMM waveOut 48kHz stereo; `.zsm` and `.zcm`) |
 | `melodius.cpp` | C++ | Source code for the native Windows Melodius player |
 | `build_melodius.bat` | Windows CMD | MSVC build script for `melodius.exe` |
-| `zsmstream.asm` | 6502 ASM | Apple //e ZSM jukebox engine — streams `.ZSM` from ProDOS, normalizes the header tick rate into 60 Hz frames, plays PSG + YM2151 FM + PCM FIFO |
+| `zsmstream.asm` | 6502 ASM | Apple //e ZSM jukebox engine — streams `.ZSM` from ProDOS, normalizes the header tick rate into 60 Hz frames, plays PSG + YM2151 FM + PCM FIFO; 6-slot frame ring at `$7300-$7EFF` (5 published frames of lookahead) and a single 4 KB PCM window at `$4400-$53FF` with an in-place window cache, so a repeated drum sample never re-reads the disk |
 | `build_melodius.mjs` | Node.js | Assembles `zsmstream.asm` (slot 2/4), splits/decimates PCM companions, generates the two-level menu BASIC, packs `melodius.hdv` + `.zip` (`--list`, `--autoplay <idx>`, `--out <path>`) |
+| `update_melodius_player.mjs` | Node.js | Player-only update of an existing `melodius.hdv` (`--image`, `--out`): assemble both slots with the builder's guards, `REPLACEFILE`, then volume + catalog + extract-round-trip checks — for machines whose Melodius collection is incomplete |
 | `zsm_pcm_resample.mjs` | Node.js | Build-time PCM decimator — caps every song at VERA rate 21 (8 kHz) and re-quantizes 16-bit instruments to dithered 8-bit |
 | `src/melodius/*.bas` | Applesoft BASIC | Generated jukebox menus (`STARTUP.bas` category list + one file per category) |
 | `zsmplay.asm` | 6502 ASM | Legacy FM bring-up player (embedded event stream); `build_zsmplay_po.mjs` packs `zsmplay.po` locally — that image is not committed |
@@ -828,6 +829,31 @@ node tools\build_melodius.mjs --autoplay 23
 # slot — never as a floppy)
 Release\AppleWin.exe -s2 vera -s7 hdc -h1 C:\dev\veramusic\melodius.hdv -power-on
 ```
+
+**When the full builder cannot run** (the local Melodius collection is missing a
+category folder, e.g. `ZSM/Game Soundtracks/MINE-RESCUE` or `PCM/`, and
+`build_melodius.mjs` scans every category), update the shipped image in place
+instead — only the player binary changes, all songs and menus stay untouched:
+
+```cmd
+:: assemble both slots with the builder's guards, replace the player inside a
+:: copy, verify volume/catalog/round-trip bytes, then swap the copy in
+node tools\update_melodius_player.mjs            :: rewrites melodius.hdv
+node tools\update_melodius_player.mjs --out test.hdv   :: dry run on a copy
+tools\cadius.exe CHECKVOLUME melodius.hdv
+tools\cadius.exe CATALOG melodius.hdv           :: BIN $2000, 7732 B
+```
+
+The tool performs, in order: assembly with `branchGuard` + `zeroGuard` +
+`$3F00` limit (code ends `$3E34`), write of `src/MELODIUS.BIN` /
+`src/MELODIUS4.BIN`, `REPLACEFILE` with the staged name carrying type/aux
+(`#062000`), `CHECKVOLUME`, catalog assertion, and an `EXTRACTFILE` round-trip
+that must equal the assembled bytes.
+
+The staged filename carrying type/aux matters: without `#062000` Cadius writes
+`UNK $0000` and ProDOS will not `BLOAD` the player. Verify the boot separately
+by saving a headless state and decoding text page `$0400` (mask each byte with
+`$7F`): it must contain `MELODIUS - A2VERA ZSM JUKEBOX`.
 
 ## File-Level I/O and Cadius Migration (2026-10-11)
 
@@ -941,3 +967,33 @@ Song order: 0 Title, 1 Level 1, 2 Level 2, 3 Level 2 Alt, 4 Level 3, 5 Level 4, 
 - Provenance of the shipped streams: 0 mismatched ticks out of 31,147 across the three tracks (`SB-INTRO` 20,385 / `CANYON` 7,570 / `GREENHILL` 3,192), verified by `veratest`'s `node src/verify_music_streams.mjs`, which rebuilds the streams, diffs them against the packaged `.vzm` files and replays both the raw ZSM and the converted stream register-image by register-image.
 - Sizes: `SB-INTRO` 346,425 B → 347,136 B (678 blocks), `CANYON` 129,168 B → 124,416 B (243), `GREENHILL` 22,337 B → 18,432 B (36). Raw `GREENHILL.ZSM` would need 44 blocks, which does not fit the demo floppy's remaining 4; the 32 MB slideshow would fit either.
 - `veratest` documents the format in its `AGENTS.md` §4.4 and `README.md` ("The VZM Stream Format (ZSM → A2VERA)"); the players are `src/slideshow/slideshow.asm` and `src/veratest/sonic.asm`. `veramusic` itself is unchanged by this milestone — it remains the ZSM producer and the direct-ZSM reference player.
+
+### Milestone 47: Apple //e stutter + grain killed - 6-slot frame ring, 4 KB PCM window, window cache (2026-10-25)
+
+- **Symptoms, in the user's words**: first the FM-heavy songs stuttered (「尤其是播放一些fm音樂」), then after the first fix 「速度ok, 但有雜音」 and 「鼓敲打聲會有沙沙聲」. The final gate was both at once: no grain, and the tempo of the accepted build.
+- **Two independent causes, easy to confuse**:
+  1. *Dropped ticks* - every drum hit read the sample in two 2 KB windows, ~1.5 frames each, and the frame ring only allowed 4 published frames of lookahead, so a hit cost ~2 dropped ticks (5.67 % of all ticks, 56.6 fps).
+  2. *The grain* - a FIFO underrun right after each trigger, not the prefetch logic. With a 256 B `PCM_PREFILL` the FIFO holds 32 ms, i.e. two frames, and the trigger burst itself costs ~3, so it ran dry on every hit.
+- **Fix 1 - frame ring 5 -> 6 slots.** `FB_SLOTS = 6`, `FB_MAX = 5`, ring at `$7300-$7EFF` (slot n is at `($73 + 2n)*$100`). The ring needed the space, so `YM_SCRATCH` moved from `$7D00` (which is ring slot 5) to the free 512 B at `$5400`. Cost: nothing; lookahead went from 4 to 5 frames.
+- **Fix 2 - one 4 KB PCM window.** `PCM_BUFFER_SIZE = $1000` merges the two 2 KB staging windows into `$4400-$53FF`. A measured drum sample is 2667 B, so a trigger now needs one MLI read instead of two (`pcmWin` 82 -> 42 for a 40-hit run). The double-buffer prefetch that needed two windows was switched off (`PCM_ARM_PRE`/`PCM_PRE_STEP` return immediately, `PCM_WIN` stays 0); it had in fact never staged anything in the shipped build (an instrumented run counted 0 arms, 39 synchronous refills), so nothing was lost.
+- **Fix 3 - window cache.** `PCM_FILL_WINDOW` compares the requested file position and length against `PCM_CPOS`/`PCM_CLEN` (the window currently in `PCM_BUFFER`) and, on a match, feeds those bytes without calling MLI at all. Drum samples repeat for the whole song and feeding only moves `PCM_PTR`, never the data, so even a partially-fed window is a valid entry; `PCM_CPOS_H = $FF` poisons the cache after a failed read. This is what turned 42 calls into **4 real disk reads**.
+- **Measured on Crockett (`MOO03.ZSM` + `MOO03.PCM`), AppleWin 40 M cycles ≈ 36.7 s at 1.02 MHz** (dropped ticks / total, published fps):
+
+  | Build | drops | fps |
+  |---|---:|---:|
+  | original player | 230 / 2203 (10.44 %) | 53.71 |
+  | 4-slot ring | 162 (7.35 %) | - |
+  | 5-slot ring | 125 (5.67 %) | 56.62 |
+  | 6-slot ring | 88 (3.99 %) | 57.68 |
+  | + 4 KB window | 49 (2.22 %) | 58.75 |
+  | + window cache (shipped) | **4 (0.18 %)** | **59.86** |
+
+  The FM-dense control song (`X16ROBOTS` `MAIN`) stays 0 drops / 60.08 fps, and `pcmWin` is 0 there because it has no PCM table.
+- **Audio verification by waveform, since 「聽起來」 is not a measurement.** `-fm-wav-dump` (20 s, `-power-on`, no `-m`; `-m` suppresses the dump) then clicks/maxSlope/hfRatio. The 256 B-prefill build that produced the 沙沙聲 measures `clicks=1461 (97.4/s), hfRatio=0.3823`; 1 KB prefill `0 / 0.1319`; the shipped build `1 (0.07/s) / maxSlope 12,359 / hfRatio 0.1423`; the old reference player `0 / 9,194 / 0.1355`. The shipped `melodius.hdv` itself, played through a temporary autoplay `STARTUP`, measures `clicks=2 (0.13/s) / 12,344 / 0.1457` - same class as the test image, so the image update did not change the sound.
+- **How the shipped image was updated** (the full builder cannot run on this machine: the local Melodius collection is missing `ZSM/Game Soundtracks/MINE-RESCUE` and `PCM/`, and `build_melodius.mjs` scans every category):
+  1. `node` build of both slots with the builder's own guards (branch guard, `$0000` reference guard, `$3F00` limit; code ends `$3E34`) -> `src/MELODIUS.BIN` / `src/MELODIUS4.BIN`.
+  2. `tools/cadius.exe REPLACEFILE <image> /MELODIUS <file>` with the staged name carrying type/aux (`MELODIUS.BIN#062000`), on a copy of `melodius.hdv`.
+  3. `CHECKVOLUME` clean, `CATALOG` shows 7732 B / aux `$2000`, `EXTRACTFILE` round-trip hashes equal to `src/MELODIUS.BIN`.
+  4. Boot check: headless AppleWin save state, text page `$0400` decodes to `MELODIUS - A2VERA ZSM JUKEBOX` (the menu). `STARTUP` and every song file stay untouched, so the two-level menu and all 94 songs are unchanged.
+- **Save-state traps hit in this milestone**: pages are sparse (`Main Memory:` holds only non-zero pages), so per-page regexes need `^\s*([0-9A-F]{4}):` with no end anchor; text-page bytes are normal-video characters with bit 7 set, so decode with `& $7F` or the banner looks like garbage; counter values in `$7F00+` read `$FF` (65535) when never written, i.e. "0 events", not "boot failure"; and an AppleWin instance running while the user plays steals CPU and invents drops - never trust a measurement taken while their emulator is up.
+- **Costs left on the table** (deliberately not taken): the remaining 4 drops are start-up and song-boundary artefacts, not drum reads; a 5 KB window would need RAM that the code region and the stream buffer occupy. The PCM window is now the largest single I/O burst in the player, so any further work should target the stream refill (20-22 per run, 512 B each), not the drums.

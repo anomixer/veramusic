@@ -23,12 +23,26 @@
 ; four ZSM ticks' register writes applied together. Rates below 60 publish a
 ; hold frame when no tick is due.
 ;
-; Frame buffer (double-buffered, ping-pong):
+; Frame ring (6 x 512 B, so the decoder can run up to 5 frames ahead) at
+;   $7300..$7EFF; the YM2151 pair accumulator lives at $5400 so the whole ring
+;   fits above it:
 ;   [psgCnt][reg,val]x psgCnt [ymCnt][reg,val]x ymCnt   (psgCnt=$FF = hold frame)
-;   Decoder builds the next frame in the write buffer; on a frame boundary it
-;   waits for FB_READY==0, publishes FB_ACT=base, FB_READY=1, then swaps buffers.
-;   IRQ consumes the published frame, applies PSG (VRAM $F9C0) + YM ($Cs21), and
-;   clears FB_READY.
+;   The decoder builds the next frame in ring slot FB_HEAD and publishes it by
+;   advancing FB_HEAD / bumping FB_CNT under SEI; the IRQ applies ring slot
+;   FB_TAIL and pops it. Because five frames of lookahead are allowed, a slow
+;   pass in the main loop (a 4 KB PCM window read, a 512 B stream refill) no
+;   longer costs a tick: the IRQ keeps consuming frames already published.
+;   A tick is only skipped (TICK_NOFRAME) if the decoder fell more than five
+;   frames behind.
+;
+; PCM: one 4 KB window ($4400-$53FF) holds a whole drum sample (measured:
+;   2667 B for Crockett), so a trigger costs one MLI read instead of two. The
+;   window is also reused in place: PCM_FILL_WINDOW compares the requested file
+;   position and length against PCM_CPOS/PCM_CLEN and, on a match, feeds the
+;   bytes already in PCM_BUFFER without touching the disk. Drum samples repeat
+;   for the whole song, so nearly every hit after the first is free. Feeding
+;   only moves PCM_PTR, never the data, so a partially-fed window is still a
+;   valid cache entry; a failed read poisons PCM_CPOS_H ($FF) to invalidate it.
 ;
 ; Controls (in song): ESC/Q = stop -> menu, P/space = pause, M = mute,
 ;   +/- = vol, ]/[ = forward/backward 5 s, R = restart, L = loop toggle.
@@ -63,9 +77,9 @@ MASK_TMP = $12
 REG_TMP  = $13       ; current YM reg being decoded
 VAL_TMP  = $14       ; current value being decoded
 CMD      = $15       ; current stream command byte
-FB_ACT_L = $16       ; IRQ: published frame pointer (zp)
-FB_ACT_H = $17
-FB_READY = $18       ; 1 = frame available for IRQ
+FB_CNT   = $16       ; IRQ: published frames waiting (0..FB_MAX)
+FB_HEAD  = $17       ; IRQ: ring slot the decoder publishes from / writes next
+FB_TAIL  = $18       ; IRQ: ring slot to consume next
 SAV_L    = $19       ; IRQ VERA_ADDR save
 SAV_M    = $1A
 SAV_H    = $1B
@@ -104,12 +118,16 @@ PCM_PTR_H = $04
 
 BUF_LO  = $4000      ; 512-byte stream block buffer
 BUF_HI  = $4200
-FB_A    = $7300      ; frame buffer A (512 B)  -- above ProDOS resident code + file buf
-FB_B    = $7500      ; frame buffer B (512 B)  -- 512 B apart from FB_A (no overlap)
-YM_SCRATCH = $7700   ; YM pair accumulation buffer (512 B)  -- 512 B apart from FB_B
+FB_RING = $7300      ; 5 x 512 B published-frame ring ($73/$75/$77/$79/$7B xx00)
+FB_RING_H0 = $73     ; high byte of slot 0; slot n is at (FB_RING_H0 + 2*n)*$100
+FB_SLOTS = 6
+FB_MAX  = 5          ; published frames allowed: one ring slot is the writer's
+YM_SCRATCH = $5400   ; YM pair accumulation buffer (512 B)  -- free block above PCM_BUFFER2
 FILE_BUF = $6000
-PCM_BUFFER = $4400   ; PCM sample staging window (2048 B) -- streamed from disk
-PCM_BUFFER_SIZE = $800
+PCM_BUFFER = $4400   ; PCM window (4096 B, $4400-$53FF) -- streamed from disk
+PCM_BUFFER2 = $4C00  ; unused: the prefetch that needed a second buffer is
+                      ; disabled (the 4 KB window swallows a whole drum)
+PCM_BUFFER_SIZE = $1000
 PCM_FILE_BUF = $6400 ; PCM refnum FCB (1024 B) -- free RAM below FILE_BUF+$400
 EXT_MAGIC = $6800    ; BASIC menu: 'M','Z' marker (survives BRUN)
 EXT_NAME  = $6802    ; BASIC menu: NUL-terminated ProDOS name (max 15)
@@ -296,10 +314,13 @@ POF1_OK:
 POF2_OK:
     JSR CLEAR_SHADOW
     JSR SHOW_INFO
-    ; Initialize write-buffer base to FB_A before the first decode.
+    ; Initialize the frame ring: nothing published yet, first decode fills slot 0.
     LDA #$00
+    STA FB_CNT
+    STA FB_HEAD
+    STA FB_TAIL
     STA WRB_BASE_L
-    LDA #$73              ; FB_A high byte
+    LDA #$73              ; ring slot 0 high byte
     STA WRB_BASE_H
     ; Prefill 1 frame (IRQ not hooked yet; IRQ_ACTIVE=0 -> publish no-wait)
     JSR DECODE_FRAME
@@ -748,7 +769,7 @@ FRAME_START:
     LDA #$00
     STA PSG_CNT
     STA YM_CNT
-    LDA #$77             ; YM accumulation starts at YM_SCRATCH
+    LDA #>YM_SCRATCH     ; YM accumulation buffer (moved to $7B00)
     STA YMSCR_H
     LDA #$00
     STA YMSCR_L
@@ -780,7 +801,7 @@ AP_OK2:
     RTS
 
 ADD_YM_PAIR:
-    ; A = reg, VAL_TMP = val. YM pairs accumulate in YM_SCRATCH ($4C00),
+    ; A = reg, VAL_TMP = val. YM pairs accumulate in YM_SCRATCH ($7D00),
     ; separate from the PSG section; PUBLISH_FRAME copies them into place
     ; right after the PSG section (the IRQ reads a fixed [psg][ym] layout).
     STA REG_TMP
@@ -810,16 +831,18 @@ PUBLISH_HOLD:
     JMP PUBLISH_FRAME
 
 ; --------------------------------------------------------------------------
-; PUBLISH_FRAME — finalize frame, wait FB_READY==0 (if IRQ active), set
-; FB_ACT=base, FB_READY=1, swap write buffer.
+; PUBLISH_FRAME — finalize frame, publish it into the ring, advance FB_HEAD.
+; Waits while the ring is full (FB_CNT == FB_MAX), i.e. the decoder may run up
+; to three frames ahead of the IRQ. PCM is fed once per published frame.
 ; --------------------------------------------------------------------------
 PUBLISH_FRAME:
+    JSR PCM_FEED            ; bounded (<=256 B) FIFO top-up, once per frame
     LDA IRQ_ACTIVE
     BEQ PUB_NOWAIT
 PUB_WAIT:
-    JSR PCM_FEED            ; top up the VERA FIFO while the tick is pending
-    LDA FB_READY
-    BNE PUB_WAIT
+    LDA FB_CNT
+    CMP #FB_MAX
+    BCS PUB_WAIT
 PUB_NOWAIT:
     LDY #$00
     LDA PSG_CNT
@@ -864,7 +887,7 @@ PUB_INC1:
     LDA MOVCNT
     ORA MOVCNT_H
     BEQ PUB_SWAP          ; no YM pairs
-    LDA #$77
+    LDA #>YM_SCRATCH
     STA MOVSRC_H
     LDA #$00
     STA MOVSRC_L
@@ -896,26 +919,26 @@ PUB_DEC:
     JMP PUB_MOVE
 PUB_SWAP:
     SEI
-    LDA FRAME_L
-    STA FB_ACT_L
-    LDA FRAME_H
-    STA FB_ACT_H
-    LDA #$01
-    STA FB_READY
-    ; swap write buffer (alternate FB_A / FB_B by high byte)
-    LDA WRB_BASE_H
-    CMP #$75              ; currently FB_B?
-    BNE PUB_TO_A
+    ; publish the frame just built in ring slot FB_HEAD, then point the write
+    ; buffer at the next slot (there is always one spare: FB_CNT <= FB_MAX-1
+    ; here, and the ring has FB_SLOTS = FB_MAX+1 buffers).
+    INC FB_CNT
+    LDA FB_HEAD
+    CLC
+    ADC #$01
+    CMP #FB_SLOTS
+    BCC PUB_HEAD_OK
+    LDA #$00              ; wrap 4 -> 0
+PUB_HEAD_OK:
+    STA FB_HEAD
+    ASL A                 ; slot n high byte = $73 + 2*n
+    CLC
+    ADC #FB_RING_H0
+    STA WRB_BASE_H
+    STA FRAME_H
     LDA #$00
     STA WRB_BASE_L
-    LDA #$73              ; FB_A high byte
-    STA WRB_BASE_H
-    JMP PUB_SWAP_DONE
-PUB_TO_A:
-    LDA #$00
-    STA WRB_BASE_L
-    LDA #$75              ; FB_B high byte
-    STA WRB_BASE_H
+    STA FRAME_L
 PUB_SWAP_DONE:
     CLI
     RTS
@@ -943,14 +966,14 @@ DLS_OK:
     RTS
 
 ; SEEK_TO — SETMARK_PARAMS+2..4 already hold the 24-bit target byte offset.
-; Waits for FB_READY==0 (IRQ is idle), SET_MARKs the file cursor, refills.
+; Waits until the IRQ has consumed every published frame (FB_CNT==0), SET_MARKs the file cursor, refills.
 ; Returns CLC on success; on failure SEC + ERR=1 + DEBUG_MARKER=$13 (MAIN
 ; reports DISK_FAIL).  One-frame IRQ gap is natural (hardware sustains).
 SEEK_TO:
     LDA IRQ_ACTIVE
     BEQ ST_NOWAIT
 ST_WAIT:
-    LDA FB_READY
+    LDA FB_CNT
     BNE ST_WAIT
 ST_NOWAIT:
     LDA REF_NUM
@@ -988,7 +1011,7 @@ ST_MARK_OK:
 ; the next frame's YM batch rewrites them all); PCM sub-events are skipped.
 ; HOLD_LEFT frames are consumed like DECODE_FRAME does.  Returns CLC=frame
 ; consumed, continue; SEC=stop (STREAM_END / EOD handled by the caller
-; policy).  Requires FB_READY==0 (main loop is idle: IRQ consumes nothing).
+; policy).  Requires FB_CNT==0 (the IRQ has no frame left to apply).
 ; Clobbers A/X/Y + zp vars shared with the decode path.
 SEEK_STEP:
     LDA HOLD_LEFT
@@ -1167,7 +1190,7 @@ DO_SEEK_FWD:
     LDA IRQ_ACTIVE
     BEQ SF_NOWAIT
 SF_WAIT:
-    LDA FB_READY
+    LDA FB_CNT
     BNE SF_WAIT
 SF_NOWAIT:
     JSR CALC_SEEK_TICKS
@@ -1217,7 +1240,7 @@ DO_SEEK_BWD:
     LDA IRQ_ACTIVE
     BEQ SB_NOWAIT
 SB_WAIT:
-    LDA FB_READY
+    LDA FB_CNT
     BNE SB_WAIT
 SB_NOWAIT:
     JSR CALC_SEEK_TICKS
@@ -1304,7 +1327,7 @@ DO_RESTART:
     LDA IRQ_ACTIVE
     BEQ RS_NOWAIT
 RS_WAIT:
-    LDA FB_READY
+    LDA FB_CNT
     BNE RS_WAIT
 RS_NOWAIT:
     LDA #$00
@@ -1740,12 +1763,34 @@ PT_START:
     LDA #$00
     STA VERA_AUDIO_RATE
     JSR PCM_WRITE_CTRL
+
     JSR PCM_FILL_WINDOW
     LDA PCM_IOERR
     BNE PT_FAIL
     LDA PCM_ACTIVE
     BEQ PT_RTS
+    ; The window just read covers the whole sample in the usual case, so only
+    ; the feed cursor has to be armed. PCM_WIN/PCM_PRE belong to the disabled
+    ; prefetch machinery (see "PCM staging" below) and stay cleared.
+    LDA #$00
+    STA PCM_WIN
+    STA PCM_PRE
+    LDA #<PCM_BUFFER
+    STA PCM_PTR_L
+    LDA #>PCM_BUFFER
+    STA PCM_PTR_H
+    LDA PCM_POS_L
+    CLC
+    ADC PP_LEFT_L
+    STA PCM_LOAD_L
+    LDA PCM_POS_M
+    ADC PP_LEFT_H
+    STA PCM_LOAD_M
+    LDA PCM_POS_H
+    ADC #$00
+    STA PCM_LOAD_H
     JSR PCM_PREFILL
+    JSR PCM_ARM_PRE
     LDA PCM_RATE
     STA VERA_AUDIO_RATE
 PT_RTS:
@@ -1800,6 +1845,34 @@ PFW_CAP:
     LDA #>PCM_BUFFER_SIZE
     STA PCM_COUNT_M
 PFW_MARK:
+    ; The window still in PCM_BUFFER can be reused verbatim when a trigger
+    ; asks for the same file position and length again (drum samples repeat
+    ; for the whole song, and feeding only moves PCM_PTR, never the data).
+    LDA PCM_CPOS_L
+    CMP PCM_FPOS_L
+    BNE PFW_LOAD
+    LDA PCM_CPOS_M
+    CMP PCM_FPOS_M
+    BNE PFW_LOAD
+    LDA PCM_CPOS_H
+    CMP PCM_FPOS_H
+    BNE PFW_LOAD
+    LDA PCM_CLEN_L
+    CMP PCM_COUNT_L
+    BNE PFW_LOAD
+    LDA PCM_CLEN_M
+    CMP PCM_COUNT_M
+    BNE PFW_LOAD
+    LDA #<PCM_BUFFER          ; cache hit: no disk read at all
+    STA PCM_PTR_L
+    LDA #>PCM_BUFFER
+    STA PCM_PTR_H
+    LDA PCM_COUNT_L
+    STA PP_LEFT_L
+    LDA PCM_COUNT_M
+    STA PP_LEFT_H
+    RTS
+PFW_LOAD:
     LDA PCM_REF
     STA SETMARK_PARAMS+1
     LDA PCM_FPOS_L
@@ -1817,6 +1890,8 @@ PFW_MARK:
     STA ERRSRC
     LDA #$01
     STA PCM_IOERR
+    LDA #$FF                 ; buffer contents unknown now
+    STA PCM_CPOS_H
     RTS
 PFW_READ:
     LDA PCM_REF
@@ -1840,6 +1915,8 @@ PFW_READ:
     STA ERRSRC
     LDA #$01
     STA PCM_IOERR
+    LDA #$FF
+    STA PCM_CPOS_H
     RTS
 PFW_DONE:
     ; Arm the feed cursor: PCM_BUFFER holds the window that starts at sample
@@ -1848,9 +1925,20 @@ PFW_DONE:
     STA PCM_PTR_L
     LDA #>PCM_BUFFER
     STA PCM_PTR_H
+    LDA PCM_FPOS_L
+    STA PCM_CPOS_L
+    LDA PCM_FPOS_M
+    STA PCM_CPOS_M
+    LDA PCM_FPOS_H
+    STA PCM_CPOS_H
     LDA READ_PARAMS+6
     ORA READ_PARAMS+7
     BEQ PFW_EMPTY
+    LDA READ_PARAMS+6
+    STA PCM_CLEN_L
+    LDA READ_PARAMS+7
+    STA PCM_CLEN_M
+    STA PP_LEFT_H
     LDA READ_PARAMS+6
     STA PP_LEFT_L
     LDA READ_PARAMS+7
@@ -1882,8 +1970,11 @@ PCM_FEED:
     BNE PF_NO                 ; frozen clock: don't queue audio behind the pause
     LDA PCM_ACTIVE
     BEQ PF_NO
-    LDA #$08
-    STA PP_PASSES             ; at most 8 x 128 = 1024 bytes per call
+    JSR PCM_PRE_STEP          ; stage the next window in halves, ahead of need
+    LDA #$03
+    STA PP_PASSES             ; at most 3 x 128 = 384 bytes per call: a bounded
+                              ; burst (~0.5 frame) instead of a 1 KB stall; the
+                              ; frame ring absorbs what is left
 PF_PASS:
     LDA PP_LEFT_L
     ORA PP_LEFT_H
@@ -1965,32 +2056,358 @@ PF_SAMPLE_END:
     ; zsmkit/_pcm_player: a looped instrument restarts at its loop point, an
     ; unlooped one frees the PCM channel.
     LDA PCM_LOOPED
-    BEQ PF_STOP
+    BNE PF_LOOP_POINT
+    JMP PF_STOP
+PF_LOOP_POINT:
     LDA PCM_LOOP_L
     STA PCM_POS_L
+    STA PCM_LOAD_L
     LDA PCM_LOOP_M
     STA PCM_POS_M
+    STA PCM_LOAD_M
     LDA PCM_LOOP_H
     STA PCM_POS_H
+    STA PCM_LOAD_H
+    LDA #$00                 ; staged window is stale after a loop jump
+    STA PCM_PRE
 PF_REFILL:
+    LDA PCM_PRE
+    BNE PF_SWAP
+    ; Nothing staged (trigger, loop point, sample shorter than one window):
+    ; read the window now, into buffer 0.
+PF_REFILL_SYNC:
+    LDA #$00
+    STA PCM_WIN
+    LDA #<PCM_BUFFER
+    STA PCM_PTR_L
+    LDA #>PCM_BUFFER
+    STA PCM_PTR_H
     JSR PCM_FILL_WINDOW
     ; A failed window read only stops the drums, not the song.
     LDA PCM_IOERR
     BNE PF_STOP
     LDA PCM_ACTIVE
     BEQ PF_RTS
+    LDA PCM_POS_L           ; PCM_LOAD = PCM_POS + staged bytes
+    CLC
+    ADC PP_LEFT_L
+    STA PCM_LOAD_L
+    LDA PCM_POS_M
+    ADC PP_LEFT_H
+    STA PCM_LOAD_M
+    LDA PCM_POS_H
+    ADC #$00
+    STA PCM_LOAD_H
+    JMP PF_REFILL_PRE
+PF_SWAP:
+    ; Use the window that was staged in the spare buffer. It is normally long
+    ; finished (PCM_PRE_STEP reads it in halves while the other window plays);
+    ; a very long stall can leave it half-read, so finish it here.
+PF_SWAP_WAIT:
+    LDA PCM_PRE_LEFT_L
+    ORA PCM_PRE_LEFT_M
+    BEQ PF_SWAP_DONE
+    JSR PCM_PRE_STEP
+    LDA PCM_PRE
+    BNE PF_SWAP_WAIT
+    JMP PF_STOP             ; staging failed
+PF_SWAP_DONE:
+    LDA PCM_WIN
+    EOR #$01
+    STA PCM_WIN
+    JSR PCM_WIN_PTR
+    LDA PCM_PRE_LEN_L
+    STA PP_LEFT_L
+    LDA PCM_PRE_LEN_M
+    STA PP_LEFT_H
+    LDA PCM_LOAD_L          ; PCM_LOAD += the staged window's length
+    CLC
+    ADC PCM_PRE_LEN_L
+    STA PCM_LOAD_L
+    LDA PCM_LOAD_M
+    ADC PCM_PRE_LEN_M
+    STA PCM_LOAD_M
+    LDA PCM_LOAD_H
+    ADC #$00
+    STA PCM_LOAD_H
+    LDA #$00
+    STA PCM_PRE
+PF_REFILL_PRE:
+    JSR PCM_ARM_PRE
     JMP PF_PASS
 PF_STOP:
     LDA #$00
     STA PCM_ACTIVE
     RTS
 
-; PCM_PREFILL — queue the whole 4 KB FIFO before the sample clock starts, the
-; way pcmstream.asm's PREFILL_FIFO does (32 x 128) and for the same reason: a
-; stream that starts from an empty FIFO underruns on its very first blocks.
+; --------------------------------------------------------------------------
+; PCM staging -- DISABLED, kept for reference (see PCM_ARM_PRE / PCM_PRE_STEP).
+;
+; History: the sample used to be read in 2 KB windows, and the window after the
+; one being fed was staged into a second buffer ahead of time, in 1024-byte
+; halves, so the ~1.5-frame disk burst never landed while the FIFO was empty.
+; That is what made two buffers necessary.
+;
+; It is now off for a simpler reason: one 4 KB window ($4400-$53FF) holds a
+; whole drum sample (Crockett's is 2667 B), so a trigger needs a single read,
+; and PCM_FILL_WINDOW's window cache makes every repeat of that same sample
+; free. The win was measured, not assumed: dropped ticks on Crockett fell
+; 10.44 % -> 5.67 % (6-slot ring) -> 2.22 % (4 KB window) -> 0.18 % (cache),
+; and the prefetch staged nothing at all in that build (ARM count 0), so it
+; was removed from the path rather than kept half-working.
+;
+; PCM_ARM_PRE and PCM_PRE_STEP return immediately; PCM_WIN stays 0, so the
+; feeder always reads PCM_BUFFER and PF_REFILL always takes the synchronous
+; path. PCM_BUFFER2 is unused.
+; --------------------------------------------------------------------------
+
+; PCM_WIN_PTR — point PCM_PTR at the start of staging buffer PCM_WIN.
+PCM_WIN_PTR:
+    LDA #<PCM_BUFFER
+    STA PCM_PTR_L
+    LDA #>PCM_BUFFER
+    STA PCM_PTR_H
+    LDA PCM_WIN
+    BEQ PWP_RTS
+    LDA #<PCM_BUFFER2
+    STA PCM_PTR_L
+    LDA #>PCM_BUFFER2
+    STA PCM_PTR_H
+PWP_RTS:
+    RTS
+
+; PCM_ARM_PRE — queue the window that follows the one being fed. PRE_POS is
+; PCM_LOAD; PRE_LEFT is capped at one window (PCM_BUFFER_SIZE).
+PCM_ARM_PRE:
+    RTS                      ; prefetch disabled (single 4 KB window)
+    LDA PCM_PRE
+    BEQ PAA_CONT             ; one is already queued
+    RTS
+PAA_CONT:
+    LDA PCM_LOAD_L
+    STA PCM_PRE_POS_L
+    LDA PCM_LOAD_M
+    STA PCM_PRE_POS_M
+    LDA PCM_LOAD_H
+    STA PCM_PRE_POS_H
+    LDA PCM_LEN_L
+    SEC
+    SBC PCM_LOAD_L
+    STA PCM_PRE_LEFT_L
+    LDA PCM_LEN_M
+    SBC PCM_LOAD_M
+    STA PCM_PRE_LEFT_M
+    LDA PCM_LEN_H
+    SBC PCM_LOAD_H
+    BCC PAA_LOOPW            ; past the end of the sample
+    ORA PCM_PRE_LEFT_L
+    ORA PCM_PRE_LEFT_M
+    BEQ PAA_LOOPW            ; exactly at the end of the sample
+    BNE PAA_FULL             ; >= 64 KB left, so a full window
+    LDA PCM_PRE_LEFT_M
+    CMP #>PCM_BUFFER_SIZE
+    BCS PAA_FULL
+    JMP PAA_ARM              ; short tail: stage exactly what is left
+PAA_FULL:
+    LDA #$00
+    STA PCM_PRE_LEFT_L
+    LDA #>PCM_BUFFER_SIZE
+    STA PCM_PRE_LEFT_M
+    JMP PAA_ARM
+PAA_LOOPW:
+    ; The window that follows the sample's last one starts at the loop point.
+    LDA PCM_LOOPED
+    BEQ PAA_RTS_NONE
+    LDA PCM_LOOP_L
+    STA PCM_PRE_POS_L
+    LDA PCM_LOOP_M
+    STA PCM_PRE_POS_M
+    LDA PCM_LOOP_H
+    STA PCM_PRE_POS_H
+    LDA PCM_LEN_L
+    SEC
+    SBC PCM_LOOP_L
+    STA PCM_PRE_LEFT_L
+    LDA PCM_LEN_M
+    SBC PCM_LOOP_M
+    STA PCM_PRE_LEFT_M
+    LDA PCM_LEN_H
+    SBC PCM_LOOP_H
+    BCC PAA_RTS_NONE         ; loop point past the end: nothing to stage
+    ORA PCM_PRE_LEFT_L
+    ORA PCM_PRE_LEFT_M
+    BEQ PAA_RTS_NONE
+    BNE PAA_FULL
+    LDA PCM_PRE_LEFT_M
+    CMP #>PCM_BUFFER_SIZE
+    BCS PAA_FULL
+    JMP PAA_ARM
+PAA_RTS_NONE:
+    RTS
+PAA_ARM:
+    LDA PCM_PRE_LEFT_L
+    ORA PCM_PRE_LEFT_M
+    BNE PAA_ARM_GO
+    RTS
+PAA_ARM_GO:
+    LDA #$00
+    STA PCM_PRE_LEN_L
+    STA PCM_PRE_LEN_M
+    LDA #$01
+    STA PCM_PRE
+    RTS
+
+; PCM_PRE_STEP — stage up to 1024 bytes of the queued window into the spare
+; buffer. A READ failure or a short read ends the sample the same way a
+; synchronous window read does: the drums stop, the music keeps playing.
+PCM_PRE_STEP:
+    RTS                      ; prefetch disabled
+    LDA PCM_PRE
+    BNE PPS_GO
+    RTS
+PPS_GO:
+    LDA PCM_PRE_LEFT_L
+    ORA PCM_PRE_LEFT_M
+    BNE PPS_BUSY
+    RTS
+PPS_BUSY:
+    LDA #$00
+    STA PCM_IOERR
+    ; chunk = min(PRE_LEFT, 1024)
+    LDA PCM_PRE_LEFT_M
+    CMP #$04
+    BCS PPS_CHUNK_BIG
+    LDA PCM_PRE_LEFT_L
+    STA PCM_COUNT_L
+    LDA PCM_PRE_LEFT_M
+    STA PCM_COUNT_M
+    JMP PPS_DEST
+PPS_CHUNK_BIG:
+    LDA #$00
+    STA PCM_COUNT_L
+    LDA #$04
+    STA PCM_COUNT_M
+PPS_DEST:
+    LDA #$00
+    STA PCM_COUNT_H
+    ; dest = buffer(1-PCM_WIN) + PRE_LEN
+    LDA PCM_PRE_LEN_L
+    CLC
+    ADC #<PCM_BUFFER
+    STA READ_PARAMS+2
+    LDA PCM_PRE_LEN_M
+    ADC #>PCM_BUFFER
+    STA READ_PARAMS+3
+    LDA PCM_WIN
+    BEQ PPS_MARK
+    LDA READ_PARAMS+3
+    CLC
+    ADC #$08                 ; PCM_BUFFER2 = PCM_BUFFER + $800
+    STA READ_PARAMS+3
+PPS_MARK:
+    LDA PCM_REF
+    STA SETMARK_PARAMS+1
+    LDA PCM_FILE_OFF_L
+    CLC
+    ADC PCM_PRE_POS_L
+    STA SETMARK_PARAMS+2
+    LDA PCM_FILE_OFF_M
+    ADC PCM_PRE_POS_M
+    STA SETMARK_PARAMS+3
+    LDA PCM_FILE_OFF_H
+    ADC PCM_PRE_POS_H
+    STA SETMARK_PARAMS+4
+    JSR MLI
+    !byte $CE
+    !word SETMARK_PARAMS
+    BCC PPS_READ
+    JMP PPS_FAIL
+PPS_READ:
+    LDA PCM_REF
+    STA READ_PARAMS+1
+    LDA PCM_COUNT_L
+    STA READ_PARAMS+4
+    LDA PCM_COUNT_M
+    STA READ_PARAMS+5
+    JSR MLI
+    !byte $CA
+    !word READ_PARAMS
+    BCC PPS_OK
+    CMP #$4C
+    BEQ PPS_EOF
+    JMP PPS_FAIL
+PPS_EOF:
+    ; ProDOS answered a short/zero transfer: the sample is exhausted.
+PPS_OK:
+    LDA READ_PARAMS+7
+    BNE PPS_CNT16
+    LDA READ_PARAMS+6
+    BEQ PPS_EOF2
+    STA PPS_CNT_L
+    LDA #$00
+    STA PPS_CNT_M
+    JMP PPS_ADV
+PPS_CNT16:
+    LDA READ_PARAMS+6
+    STA PPS_CNT_L
+    LDA READ_PARAMS+7
+    STA PPS_CNT_M
+PPS_ADV:
+    LDA PCM_PRE_LEN_L        ; PRE_LEN += staged
+    CLC
+    ADC PPS_CNT_L
+    STA PCM_PRE_LEN_L
+    LDA PCM_PRE_LEN_M
+    ADC PPS_CNT_M
+    STA PCM_PRE_LEN_M
+    LDA PCM_PRE_POS_L        ; PRE_POS += staged
+    CLC
+    ADC PPS_CNT_L
+    STA PCM_PRE_POS_L
+    LDA PCM_PRE_POS_M
+    ADC PPS_CNT_M
+    STA PCM_PRE_POS_M
+    LDA PCM_PRE_POS_H
+    ADC #$00
+    STA PCM_PRE_POS_H
+    LDA PCM_PRE_LEFT_L       ; PRE_LEFT -= staged
+    SEC
+    SBC PPS_CNT_L
+    STA PCM_PRE_LEFT_L
+    LDA PCM_PRE_LEFT_M
+    SBC PPS_CNT_M
+    STA PCM_PRE_LEFT_M
+    BCS PPS_RTS
+    LDA #$00                 ; over-read (end of sample): clamp
+    STA PCM_PRE_LEFT_L
+    STA PCM_PRE_LEFT_M
+    RTS
+PPS_EOF2:
+    ; The sample ends inside this window: stage what is there and stop asking.
+    LDA #$00
+    STA PCM_PRE_LEFT_L
+    STA PCM_PRE_LEFT_M
+PPS_RTS:
+    RTS
+PPS_FAIL:
+    LDA #$00
+    STA PCM_PRE
+    LDA #$01
+    STA PCM_IOERR
+    STA PCM_ACTIVE
+    RTS
+
+; PCM_PREFILL — queue about a quarter of the 4 KB FIFO before the sample clock
+; starts (8 x 128 = 1 KB, ~0.125 s at 8 kHz), the way pcmstream.asm's
+; PREFILL_FIFO primes the FIFO: a stream that starts from an empty FIFO
+; underruns on its very first blocks. Filling the whole 4 KB here costs ~4096
+; pushes (~5.6 video frames on a 1 MHz //e) and Crockett hits a drum about once
+; a second, which was the largest single source of dropped music ticks; 1 KB is
+; already 8x the margin PCM_FEED's per-frame top-up needs, and the remainder
+; fills up on its own within a few frames.
 ; PCM_FEED only touches A/Y, so X is a safe counter across the calls.
 PCM_PREFILL:
-    LDX #$20
+    LDX #$08
 PPF_LOOP:
     JSR PCM_FEED
     LDA VERA_AUDIO_CTRL
@@ -2288,7 +2705,7 @@ IRQ_DONE:
     RTI
 
 ; --------------------------------------------------------------------------
-; TICK — one VSYNC: consume the one frame the decoder published for it.
+; TICK — one VSYNC: consume the oldest frame in the publish ring.
 ; The decoder has already normalized the ZSM tick rate into 60 Hz frames, so
 ; there is no rate gating here. The stopwatch counts IRQs, not consumed
 ; frames (see TICK_NOFRAME), so T: stays locked to real time even when the
@@ -2303,7 +2720,7 @@ TICK_MCHK:
     BEQ TICK1
     JMP TICK_HOLD             ; muted: timeline keeps moving
 TICK1:
-    LDA FB_READY
+    LDA FB_CNT
     BNE TICK4
     JMP TICK_NOFRAME
 TICK4:
@@ -2311,14 +2728,20 @@ TICK4:
     ; YM frame, GAMEOVER 213), so walk it with a 16-bit pointer: Y wraps at
     ; 256 and carries into FB_RD_H. An 8-bit Y walk wrapped back into the
     ; frame header and replayed it as YM/PSG data (audible noise).
-    LDA FB_ACT_L
-    STA FB_RD_L
-    LDA FB_ACT_H
+    LDX FB_TAIL
+    TXA
+    ASL A                 ; slot n high byte = $73 + 2*n
+    CLC
+    ADC #FB_RING_H0
     STA FB_RD_H
+    LDA #$00
+    STA FB_RD_L
     LDY #$00
     LDA (FB_RD_L),Y
     CMP #$FF
-    BEQ TICK_HOLD
+    BNE TICK_NOT_HOLD      ; long form: the branch reached 129 bytes and the
+    JMP TICK_HOLD          ; assembler rejects anything past 127
+TICK_NOT_HOLD:
     STA TCNT1
     CMP #$00              ; STA doesn't touch flags: re-test psgCnt itself.
     BEQ TICK_YM           ; (leftover Z from CMP #$FF made psgCnt=0 fall through,
@@ -2384,23 +2807,38 @@ TICK_YML_V:
     DEC TCNT2
     BNE TICK_YML
 TICK_APPLY_DONE:
-    LDA #$00
-    STA FB_READY
+    JSR FB_POP
     JMP TICK_CLK
 TICK_HOLD:
-    LDA #$00
-    STA FB_READY
+    ; muted, or a psgCnt=$FF hold frame: consume it without applying anything
+    JSR FB_POP
     JMP TICK_CLK
 TICK_NOFRAME:
-    ; No frame pending (decoder behind, or a rate < 60 hold already consumed):
-    ; the stopwatch still has to advance, else T: drifts behind the audio.
+    ; No frame pending: the decoder fell more than FB_MAX frames behind (or a
+    ; rate < 60 hold already consumed). The stopwatch still has to advance,
+    ; else T: drifts behind the audio.
     JMP TICK_CLK
 TICK_FREEZE:
-    ; Paused: consume the frame without applying it and leave the clock alone.
-    ; Clearing FB_READY keeps the publish handshake alive, so the main loop
-    ; still reaches its keyboard poll and P can resume playback.
-    LDA #$00
-    STA FB_READY
+    ; Paused: drop one published frame per VSYNC and leave the clock alone, so
+    ; the decoder keeps running and P can resume playback.
+    LDA FB_CNT
+    BEQ TICK_FREEZE_RTS
+    JSR FB_POP
+TICK_FREEZE_RTS:
+    RTS
+
+; FB_POP — IRQ-side ring pop: the frame just applied is no longer needed.
+; Runs only in the IRQ, so the main loop's publish (SEI) can never observe a
+; half-updated FB_CNT.
+FB_POP:
+    DEC FB_CNT
+    INC FB_TAIL
+    LDA FB_TAIL
+    CMP #FB_SLOTS
+    BCC FB_POP_OK
+    LDA #$00              ; wrap 4 -> 0
+FB_POP_OK:
+    STA FB_TAIL
     RTS
 TICK_CLK:
     INC CLK_FRM
@@ -3572,6 +4010,16 @@ PCM_LOOP_M:
     !byte 0
 PCM_LOOP_H:
     !byte 0
+PCM_CPOS_L:              ; file position of the window in PCM_BUFFER
+    !byte 0
+PCM_CPOS_M:
+    !byte 0
+PCM_CPOS_H:
+    !byte $FF            ; $FF = contents unknown (startup, read failure)
+PCM_CLEN_L:              ; length of that window
+    !byte 0
+PCM_CLEN_M:
+    !byte 0
 PCM_FILE_OFF_L:
     !byte 0
 PCM_FILE_OFF_M:
@@ -3594,6 +4042,36 @@ PP_TMPY:
     !byte 0        ; Y saved for the per-pass bookkeeping
 PP_PASSES:
     !byte 0        ; passes left in the current PCM_FEED call
+
+
+PCM_WIN:
+    !byte 0        ; staging buffer being fed: 0 = PCM_BUFFER, 1 = PCM_BUFFER2
+PCM_PRE:
+    !byte 0        ; 1 = the following window is being staged in the other buffer
+PCM_LOAD_L:
+    !byte 0        ; sample position where the next window starts
+PCM_LOAD_M:
+    !byte 0
+PCM_LOAD_H:
+    !byte 0
+PCM_PRE_POS_L:
+    !byte 0        ; sample position of the window being staged
+PCM_PRE_POS_M:
+    !byte 0
+PCM_PRE_POS_H:
+    !byte 0
+PCM_PRE_LEFT_L:
+    !byte 0        ; bytes still to stage for it
+PCM_PRE_LEFT_M:
+    !byte 0
+PCM_PRE_LEN_L:
+    !byte 0        ; bytes already staged (the staged window's length)
+PCM_PRE_LEN_M:
+    !byte 0
+PPS_CNT_L:
+    !byte 0        ; bytes returned by the staging read
+PPS_CNT_M:
+    !byte 0
 PCM_POS_L:
     !byte 0
 PCM_POS_M:

@@ -55,3 +55,6 @@ music/LEVELCOMPLETE.psg
 zsmplay.hdv
 VERA_FM.log
 *.obj
+
+# Headless autoplay test images (32MB each)
+/build/
