@@ -116,6 +116,17 @@ drift 0 windows, tempo ratio 1.0000), against 0.382 hfRatio for the
 FIFO-underrun build that produced the audible grain. All 94 songs and both
 menu levels are unchanged.
 
+In-song keys: `P`/space pauses, `M` mutes, `+/−` set the master volume, `]`/`[`
+seek ±5 s, `R` restarts, `L` toggles the loop and `ESC`/`Q` returns to the
+menus. Both `P` and `M` **cut the sound instead of letting it ring**: all 16
+PSG voices, the PCM fifo and all eight YM2151 channels are silenced at once,
+and resuming re-sends the state that was cut (PSG shadow, PCM volume, and an
+8-byte per-channel `$08` key shadow for the FM half). A pause also *holds*
+the published-frame ring and stops the decoder, so the song resumes on the
+exact frame it stopped on rather than skipping ahead behind the silence
+(`AGENTS.md` Milestone 49; the cut measured at one VSYNC or less, peak 0 for
+the whole pause).
+
 `node tools/update_melodius_player.mjs` refreshes the player inside an existing
 image (assemble both slots, `REPLACEFILE`, then volume/catalog/byte round-trip
 checks) without needing the Melodius source collection, which the full

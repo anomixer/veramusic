@@ -23,16 +23,16 @@
 ; four ZSM ticks' register writes applied together. Rates below 60 publish a
 ; hold frame when no tick is due.
 ;
-; Frame ring (6 x 512 B, so the decoder can run up to 5 frames ahead) at
-;   $7300..$7EFF; the YM2151 pair accumulator lives at $5400 so the whole ring
+; Frame ring (8 x 512 B, so the decoder can run up to 7 frames ahead) at
+;   $6F00..$7EFF; the YM2151 pair accumulator lives at $5400 so the whole ring
 ;   fits above it:
 ;   [psgCnt][reg,val]x psgCnt [ymCnt][reg,val]x ymCnt   (psgCnt=$FF = hold frame)
 ;   The decoder builds the next frame in ring slot FB_HEAD and publishes it by
 ;   advancing FB_HEAD / bumping FB_CNT under SEI; the IRQ applies ring slot
-;   FB_TAIL and pops it. Because five frames of lookahead are allowed, a slow
+;   FB_TAIL and pops it. Because seven frames of lookahead are allowed, a slow
 ;   pass in the main loop (a 4 KB PCM window read, a 512 B stream refill) no
 ;   longer costs a tick: the IRQ keeps consuming frames already published.
-;   A tick is only skipped (TICK_NOFRAME) if the decoder fell more than five
+;   A tick is only skipped (TICK_NOFRAME) if the decoder fell more than seven
 ;   frames behind.
 ;
 ; PCM: one 4 KB window ($4400-$53FF) holds a whole drum sample (measured:
@@ -46,6 +46,9 @@
 ;
 ; Controls (in song): ESC/Q = stop -> menu, P/space = pause, M = mute,
 ;   +/- = vol, ]/[ = forward/backward 5 s, R = restart, L = loop toggle.
+;   Pause and mute do not leave the last chord ringing: they zero the 16 PSG
+;   voices, mute the PCM fifo and release all eight YM2151 channels, and
+;   restoring re-sends the state that was cut (PSG_SHADOW, PCM_CTRL, FM_KEYS).
 ; Menu: digit 1-9,0 selects song; ESC/Q exits to BASIC (RTS).
 ; External-name mode (used by the MELODIUS jukebox BASIC menus): BASIC writes
 ; 'M','Z' at $6800 and a NUL-terminated ProDOS name at $6802, then BRUNs the
@@ -333,7 +336,10 @@ MAIN:
     BNE SONG_DONE_JMP
     LDA ERR
     BNE DISK_FAIL_JMP
+    LDA PAUSE            ; paused: the ring is held, so decoding here would
+    BNE MAIN_KEYS        ; spin on FB_CNT and never scan the keyboard again
     JSR DECODE_FRAME
+MAIN_KEYS:
     INC ST_DIV            ; the status line is a display: redraw it about
     LDA ST_DIV            ; 7 times a second, not once per decoded frame
     AND #$07
@@ -2560,11 +2566,16 @@ DO_MUTE:
     STA MUTE
     JSR SILENCE_ALL
     JSR PCM_MUTE
-    CLI
+    JSR FM_KEY_OFF        ; M mutes the FM half too; without it the chip
+    CLI                   ; keeps the last chord ringing through a mute
     JMP MAIN
 DO_UNMUTE:
+    LDA PAUSE             ; unmuting a paused song stays silent until P
+    BNE DU_STAY_SILENT
     JSR RESTORE_ALL
     JSR PCM_WRITE_CTRL
+    JSR FM_KEYS_RESTORE
+DU_STAY_SILENT:
     LDA #$00
     STA MUTE
     CLI
@@ -2573,19 +2584,51 @@ DO_UNMUTE:
 DO_PAUSE:
     LDA PAUSE
     BNE DO_RESUME
-    LDA #$01
-    STA PAUSE
-    ; pcmstream.asm freezes a PCM stream by zeroing AudioRate; the same trick
-    ; holds the FIFO's queued audio in place so P resumes mid-sample.
-    LDA #$00
-    STA VERA_AUDIO_RATE
+    JSR PAUSE_ENTER
     JMP MAIN
 DO_RESUME:
+    JSR PAUSE_EXIT
+    JMP MAIN
+
+; PAUSE_ENTER — freeze the clock and cut the sound. Without the cut the
+; IRQ simply stops applying frames, so the PSG oscillators keep running and
+; the FM envelopes sit at their sustain level: the paused screen hums the
+; last chord until P is pressed again. Silence is written once, here, not
+; per frame.
+PAUSE_ENTER:
+    SEI                   ; the VSYNC handler must not apply a frame between
+    LDA #$01              ; the flag and the silence writes
+    STA PAUSE
+    ; pcmstream.asm freezes a PCM stream by zeroing AudioRate; the same trick
+    ; holds the FIFO's queued audio in place so P resumes mid-sample. The
+    ; volume mute on top of it is what makes the pause silent -- a frozen
+    ; FIFO would otherwise hold its last sample on the wire.
+    LDA #$00
+    STA VERA_AUDIO_RATE
+    JSR SILENCE_ALL       ; PSG: all 64 voice registers to 0
+    JSR PCM_MUTE          ; PCM: volume 0, queue kept
+    JSR FM_KEY_OFF        ; FM: release all eight channels
+    CLI
+    RTS
+
+; PAUSE_EXIT — put back what PAUSE_ENTER cut. The PSG is restored from
+; PSG_SHADOW (the decoder's own register image, volume-scaled), the PCM
+; volume from PCM_CTRL, and the FM keys from FM_KEYS; while MUTE is set the
+; PSG/PCM halves stay silent so an M+P+? sequence cannot unmute by accident.
+PAUSE_EXIT:
+    SEI
     LDA #$00
     STA PAUSE
     LDA PCM_RATE
     STA VERA_AUDIO_RATE
-    JMP MAIN
+    LDA MUTE
+    BNE PE_MUTED
+    JSR FM_KEYS_RESTORE
+    JSR RESTORE_ALL
+    JSR PCM_WRITE_CTRL
+PE_MUTED:
+    CLI
+    RTS
 
 DO_VOL_UP:
     LDA MASTER_VOL
@@ -2749,7 +2792,8 @@ IRQ_DONE:
 TICK:
     LDA PAUSE
     BEQ TICK_MCHK
-    JMP TICK_FREEZE           ; paused: no output, clock frozen
+    RTS                       ; paused: hold the ring, the clock and the
+                              ; FIFO exactly where P caught them
 TICK_MCHK:
     LDA MUTE
     BEQ TICK1
@@ -2832,6 +2876,7 @@ TICK_YML:
     INC FB_RD_H
 TICK_YML_R:
     LDA (FB_RD_L),Y       ; reg
+    TAX
     STA YM_REG
     INY
     BNE TICK_YML_V
@@ -2839,6 +2884,18 @@ TICK_YML_R:
 TICK_YML_V:
     LDA (FB_RD_L),Y       ; val
     STA YM_DATA
+    ; $08 is the key register (operator mask | channel). Keep the last byte
+    ; written per channel so P and M can re-key exactly what was sounding
+    ; instead of guessing -- a made-up mask retriggers channels that were
+    ; already released. IRQ_HANDLER saves X/Y, so X is free here.
+    CPX #$08
+    BNE TICK_YML_ST
+    PHA
+    AND #$07
+    TAX
+    PLA
+    STA FM_KEYS,X
+TICK_YML_ST:
     DEC TCNT2
     BNE TICK_YML
 TICK_APPLY_DONE:
@@ -2853,14 +2910,6 @@ TICK_NOFRAME:
     ; rate < 60 hold already consumed). The stopwatch still has to advance,
     ; else T: drifts behind the audio.
     JMP TICK_CLK
-TICK_FREEZE:
-    ; Paused: drop one published frame per VSYNC and leave the clock alone, so
-    ; the decoder keeps running and P can resume playback.
-    LDA FB_CNT
-    BEQ TICK_FREEZE_RTS
-    JSR FB_POP
-TICK_FREEZE_RTS:
-    RTS
 
 ; FB_POP — IRQ-side ring pop: the frame just applied is no longer needed.
 ; Runs only in the IRQ, so the main loop's publish (SEI) can never observe a
@@ -3188,6 +3237,23 @@ FKO_LOOP:
     BNE FKO_LOOP
     RTS
 
+; FM_KEYS_RESTORE — re-key the channels that were sounding when pause/mute
+; cut the chip. YM2151 $08 is the only register a key state lives in, and
+; FM_KEYS holds the last byte written per channel (0 = released). Pitch,
+; timbre and total level stay latched in the chip across the cut, so the
+; re-send resumes the same notes rather than a made-up chord.
+FM_KEYS_RESTORE:
+    LDA #$08
+    STA YM_REG
+    LDX #$00
+FKR_LOOP:
+    LDA FM_KEYS,X
+    STA YM_DATA
+    INX
+    CPX #$08
+    BNE FKR_LOOP
+    RTS
+
 RESTORE_ALL:
     LDA #$00
     STA VERA_CTRL
@@ -3225,6 +3291,8 @@ APPLY_PSG_VOL:
     SEI
     LDA MUTE
     BNE APV_PSG_MUTED
+    LDA PAUSE             ; a volume change while paused would re-open the
+    BNE APV_PSG_MUTED     ; PSG the pause just silenced
     JSR RESTORE_ALL
 APV_PSG_MUTED:
     CLI
@@ -3297,6 +3365,11 @@ CS_L:
     INX
     CPX #$40
     BNE CS_L
+    LDX #$08              ; a song change starts with every FM channel
+CS_KEY:                   ; released, so the key shadow has to say so
+    DEX
+    STA FM_KEYS,X
+    BNE CS_KEY
     RTS
 
 ; --------------------------------------------------------------------------
@@ -3890,6 +3963,9 @@ SONG_TITLES:
     ASC "TRACK2 (FMMASK $1F)                  "
     ASC "CMDR DEMO (DUAL MASK)                "
     ASC "SHOVEL KNIGHT (PCM)                  "
+
+FM_KEYS:              ; last YM2151 $08 byte per channel (0 = released)
+    !byte 0,0,0,0,0,0,0,0
 
 ; --------------------------------------------------------------------------
 ; State + MLI params
