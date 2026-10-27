@@ -1,7 +1,7 @@
 # VERA Music (veramusic) — Apple II VERA Audio Architecture & Development Guide
 
 **Repository**: `https://github.com/anomixer/veramusic`  
-**Target Hardware**: Apple II (Enhanced IIe, IIgs, Laser 128) with VERA card in Slot 2 (`$C0A0`) or Slot 4 (`$C0C0`).  
+**Target Hardware**: Apple II (Enhanced IIe, IIgs, Laser 128) with VERA in Slot 2 (`$C200`) or Slot 4 (`$C400`). YM2151 uses `$C0A0/$C0A1` or `$C0C0/$C0C1`.
 **Test Emulators**: Apple2TS web emulator, AppleWin VERA fork (`anomixer/AppleWin`).  
 **Audience**: AI agents and human developers continuing the audio pipeline development.
 
@@ -17,13 +17,13 @@ The VERA card on Apple II provides:
   - `wave`: bits 7:6 = Waveform (`00` = Pulse, `01` = Sawtooth, `10` = Triangle, `11` = Noise). Bits 5:0 = Pulse width (duty cycle).
   - Internal base clock: `25 MHz / 512 = 48,828.125 Hz`. Phase accumulator: 17-bit (`% 131,072`).
   - Frequency calculation: `N = round(f * 131072 / 48828.125) = round(f * 2.68435456)`.
-- **1-channel 8-bit Signed PCM FIFO** at `$1F9C0 + $1D` (`VERA_AUDIO_DATA`):
+- **1-channel 8-bit Signed PCM FIFO** at VERA offset `$1D` (`VERA_AUDIO_DATA`):
   - 4 KB hardware FIFO buffer.
-  - Rate register (`VERA_AUDIO_RATE`, `$1E`): rate = 1..128, actual Hz = `(rate / 128) * 48828.125 Hz`. Rate `21` (`$15`) = **8010.864 Hz**.
-  - Ctrl register (`VERA_AUDIO_CTRL`, `$1C`): bit 7 = FIFO reset, bit 5 = stereo/mono (0=mono), bits 3:0 = volume (0..15).
-- **YM2151 FM Synthesizer (emulated in AppleWin fork only)**:
-  - The Commander X16 has a Yamaha YM2151 (OPM) chip on board; the **physical Apple II VERA card has NO YM2151**.
-  - The **AppleWin VERA fork** (`anomixer/AppleWin`) emulates the YM2151 with the **ymfm** synthesis core (`source\ymfm\`, registers at slot base + `$20`/`$21`, e.g. `$C220`/`$C221` on Slot 2), so ZSM music with FM plays back in the emulator.
+  - Rate register (`VERA_AUDIO_RATE`, `$1C`): rate = 1..128, actual Hz = `(rate / 128) * 48828.125 Hz`. Rate `21` (`$15`) = **8010.864 Hz**.
+  - Ctrl register (`VERA_AUDIO_CTRL`, `$1B`): bit 7 = FIFO reset, bit 5 = stereo/mono (0=mono), bits 3:0 = volume (0..15).
+- **YM2151 FM Synthesizer**:
+  - A2VERA EV1 supports YM2151 or its OPM2151 FPGA replacement. The AppleWin VERA fork emulates YM2151 with ymfm.
+  - FM uses `/DEVICE SELECT`: Slot 2 `$C0A0` (`YM_SEL`) / `$C0A1` (`YM_DATA`), Slot 4 `$C0C0` / `$C0C1`. The old `$Cs20/$Cs21` FM mapping has been removed from the matching AppleWin build.
   - `tools/melodius.exe` renders the same YM2151 + VERA PSG + VERA PCM mix natively on Windows for auditioning `.zsm` and `.zcm` files (originally `tools/zsmplay.exe`, see Milestones 30 and 34).
 
 ### 1.2 Host CPU & Memory Constraints
@@ -74,7 +74,7 @@ The VERA card on Apple II provides:
     - Track 2: Chopin Fantaisie-Impromptu (Stream PSG, 5:17, blks 100–270)
     - Track 3: Space Debris (Hybrid PSG+PCM, 5:05, blks 5000–9884)
     - Track 4: The Wellerman (Stream PCM, 2:00, blks 600–2486)
-- Applesoft BASIC auto-detects VERA card in Slot 2 (`$C0A0`) or Slot 4 (`$C0C0`) and launches the corresponding player binary.
+- Applesoft BASIC auto-detects VERA card in Slot 2 (`$C200`) or Slot 4 (`$C400`) and launches the corresponding player binary.
 
 ### Milestone 6: Copyright Compliance & Wellerman Integration
 - Purged all copyrighted Michael Jackson - Beat It files.
@@ -509,14 +509,14 @@ The VERA card on Apple II provides:
 - **User Problem**: `zsmplay.exe` compiled against `C:\dev\applewin\source\ymfm` via an absolute include path, making the veramusic build non-portable. Additionally, `.zsm` music from the x16-hero-vera port (`C:\dev\x16-hero-vera\assets\*.ZSM`) could only be auditioned on Windows — there was no Apple //e-side player that writes the YM2151 FM events through the VERA card's FM daughterboard registers.
 - **Bundled ymfm** (`ymfm/`): `ymfm.h`, `ymfm_fm.h`, `ymfm_opm.h`, `ymfm_fm.ipp`, `ymfm_opm.cpp`, `LICENSE` copied from `AppleWin\source\ymfm`. `tools/build_zsmplay.bat` now uses `set YMFM=%~dp0..\ymfm` (repo-relative) instead of the absolute AppleWin path, so the Windows player builds self-contained.
 - **Apple //e ZSM player** (`src/zsmplay.asm`):
-  - 65C02 program loaded via `BRUN ZSMPLAY.BIN` at `$2000`; writes YM2151 host registers through `YM_REG = VERA_BASE + $20` (register select) and `YM_DATA = VERA_BASE + $21` (data/status) — same convention as the Commander X16 `$9F40`/`$9F41`.
+  - Historically this 65C02 program used `VERA_BASE + $20/$21`. The 2026-10-27 migration changed it to `YM_SEL/YM_DATA` at the slot's `/DEVICE SELECT` ports; see the current migration note below.
   - **Code-first layout**: all `.byte` data tables (`INIT_REGS`, `ZSM_STREAM`) live *after* the code. An earlier version placed the stream data before `START`, so BRUN began executing raw data. Data tables use `$FF` terminators.
   - **Channel 0 init**: `INIT_REGS` programs reg `$20` = `$C7` (RL = L+R, CON = 7 parallel operators), MUL = 1 for all 4 operators (`$40/$48/$50/$58`), TL = `$7F` (`$60–$78`), AR = `$1F` instant attack (`$80–$98`), RR = 7 fast release (`$E0–$F8`).
   - **ZSM event walk**: `ZSM_STREAM` holds `[reg, val]` pairs; the main loop writes `reg → YM_REG`, `val → YM_DATA`, then a ~1 frame delay. Verified event sequence in the AppleWin `-log` output: `$28/$4A` (KC concert A) → `$08/$78` key-on → `$08/$00` key-off → `$28/$5A` (octave up) → `$08/$78` → `$08/$00`.
   - **Exit is `RTS`, not `JMP $03D0`**: under ProDOS/BASIC.SYSTEM, jumping to the DOS 3.3 warm-start vector `$03D0` makes BASIC.SYSTEM attempt to reload itself → `** Unable to load BASIC.SYSTEM **`. `RTS` returns cleanly to the BASIC interpreter (BRUN's return vector).
   - **Delay preserves the stream index**: `DELAY_FRAME` originally did `LDX #$30` for its nested delay loops, clobbering the `X` stream pointer — the event loop then re-wrote the first register pair forever (297 × `$28/$4A`, key-on never reached). Fixed with `TXA/PHA` … `PLA/TAX` around the delay.
   - **Dual-slot build**: `src/ZSMPLAY.BIN` (slot 2, `VERA_BASE = $C200`) + `src/ZSMPLAY4.BIN` (slot 4, `$C400`).
-- **ProDOS image** (`tools/build_zsmplay_po.mjs` → `zsmplay.po`, 140 KB): built from the `veratest/assets/ProDOS 2.4.3.po` template with the same directory/bitmap allocation logic as `build_fmtest_po.mjs`. Contains `ZSMPLAY.BIN`, `ZSMPLAY4.BIN` (type `$06`, aux `$2000`) and `STARTUP` (type `$FC`).
+- **ProDOS image** (`tools/build_zsmplay_po.mjs` → `zsmplay.po`, 140 KB): built from the `veratest/assets/ProDOS 2.4.3.po` template. The renamed FMTEST builder now uses Cadius for directory and allocation management. Contains `ZSMPLAY.BIN`, `ZSMPLAY4.BIN` (type `$06`, aux `$2000`) and `STARTUP` (type `$FC`).
 - **Startup slot probe** (`src/zsmplay_startup.bas`): the Applesoft STARTUP mirrors `fmtest_startup.bas` — POKEs `$C205`/`$C405` (VERA_CTRL) expecting a read-back, then writes/reads a pattern at DATA0 (`$C203`/`$C403`) to positively identify a slot-2 or slot-4 VERA card before `BRUN ZSMPLAY.BIN` / `BRUN ZSMPLAY4.BIN`.
 - **Verified** (`AppleWin.exe -d1 zsmplay.po -s2 vera -log`): disk boots, slot-2 VERA detected, `ZSMPLAY.BIN` runs, 48 FM register writes (34 init + 12 stream + 2 key-off) with the full key-on/key-off pattern present, then returns to BASIC with no crash.
 - **Gotcha**: `.po` (ProDOS floppy, `-d1`) and `.hdv` (hard-disk image, `-h1`/`-h2`) are different formats — an `.hdv` is not a renamed `.po`, and copying an unrelated `.hdv` (e.g. the x16-hero-vera game image) just ships that image's contents.
@@ -731,8 +731,7 @@ Analysis of `zsmkit.s` and `CANYON.ZSM` reveals:
    - When users listen to MIDI demos on X16 equipped with a SAM2695 or Roland Sound Canvas via UART, they are hearing **real PCM acoustic recordings of a Steinway grand piano** stored in ROM.
 
 ### 3.2 Why `mid2psg.mjs` (Fantaisie-impromptu.psg) Sounds Thin in Comparison
-On the Apple II VERA card, there is **no YM2151 and no MIDI wavetable daughtercard**.
-Our current `mid2psg.mjs` synthesizes the piano notes using VERA PSG alone:
+This historical comparison concerns `mid2psg.mjs`, which synthesizes piano notes using VERA PSG alone even when YM2151 FM is available:
 1. **Single Static Triangle Waveform**:
    - `target.wave = VERA_WAVE_TRI;`
    - Pure triangle wave has only weak odd harmonics ($1/n^2$). It sounds like a smooth organ or flute, with no hammer strike attack or string resonance.
@@ -782,7 +781,7 @@ To make MIDI piano on VERA PSG sound substantially more authentic ("原汁原味
 | `update_melodius_player.mjs` | Node.js | Player-only update of an existing `melodius.hdv` (`--image`, `--out`): assemble both slots with the builder's guards, `REPLACEFILE`, then volume + catalog + extract-round-trip checks — for machines whose Melodius collection is incomplete |
 | `zsm_pcm_resample.mjs` | Node.js | Build-time PCM decimator — caps every song at VERA rate 21 (8 kHz) and re-quantizes 16-bit instruments to dithered 8-bit |
 | `src/melodius/*.bas` | Applesoft BASIC | Generated jukebox menus (`STARTUP.bas` category list + one file per category) |
-| `zsmplay.asm` | 6502 ASM | Legacy FM bring-up player (embedded event stream); `build_zsmplay_po.mjs` packs `zsmplay.po` locally — that image is not committed |
+| `fmtest.asm` | 6502 ASM | FM sound test; `build_fmtest_po.mjs` creates local `FMTEST.po` (not committed) |
 | `zsm_scan.mjs` | Node.js | ZSM event composition analyzer (PSG/YM register histograms) |
 | `zsm_pan.mjs` | Node.js | ZSM stereo panning usage analyzer |
 | `mid2psg.mjs` | Node.js | Standard MIDI File (.mid) → 60Hz PSG register stream converter |
@@ -1033,3 +1032,48 @@ Song order: 0 Title, 1 Level 1, 2 Level 2, 3 Level 2 Alt, 4 Level 3, 5 Level 4, 
 - **Measured with an auto-pause test player** (P at VSYNC 60, resume at VSYNC 180, `-fm-wav-dump`, 20 s capture, 1 ms envelope windows): the last sounded window is 2.445 s (peak 4,680) and 2.446 s is exactly 0, so the cut is one VSYNC or less, with no release tail; the gap is **2.02 s** (the 120 VSYNCs the test asked for) of digital silence (peak 0 in every window); playback returns at the same peak (6,112 before and after). On `BLANKPAGE`, which carries PCM drums, the PCM half is silent as well.
 - **Regression**: with the patch the 40 M-cycle benches are unchanged - `BLANKPAGE` applied 2247 / 2248 ticks, Crockett 2205 / 2206, `X16ROBOTS MAIN` 2213 / 2214 (the single missing tick in each is the start-up pre-fill). Code is 7887 B, ends `$3ECF`, still under the `$3F00` limit (49 B of headroom).
 - **Shipped**: `src/zsmstream.asm`, `src/MELODIUS.BIN` / `MELODIUS4.BIN` (7887 B, aux `$2000`), `melodius.hdv` + `.zip` (volume check clean, catalog updated, extracted player byte-identical, boot check still draws `MELODIUS - A2VERA ZSM JUKEBOX`). `STARTUP` and all 94 songs untouched.
+
+
+### Milestone 50: YM2151 hardware I/O mapping (2026-10-27)
+
+- The A2VERA EV1 FM ports use `/DEVICE SELECT`, independent of VERA's Cx
+  register window: Slot 2 `YM_SEL=$C0A0` / `YM_DATA=$C0A1`; Slot 4
+  `$C0C0/$C0C1`. Legacy `$C220/$C221` and `$C420/$C421` are no longer FM
+  aliases in the matching AppleWin (`feat/verafm`, commit `686ef562`).
+- `src/vera.inc` defines `YM_SEL=FM_BASE` and `YM_DATA=FM_BASE+$01`.
+  The sibling `veratest/src/asm6502.mjs` injects `FM_BASE=$C080+slot*$10`,
+  so both `zsmstream.asm` and `fmtest.asm` use the same slot-aware symbols.
+  The sibling checkout must include `FM_BASE` support (veratest `a158b95` or
+  later). This migration was implemented with AI assistance.
+- `node tools/update_melodius_player.mjs` assembled both players (7887 B,
+  end-exclusive `$3ECF`), replaced them in a copy of `melodius.hdv`, checked
+  the volume/catalog and compared both extracted binaries. Its in-place path
+  now rebuilds `melodius.hdv.zip`; `--out` leaves the source image/ZIP alone.
+  The ZIP entry CRC and bytes were verified against the image. This player-only
+  path avoids requiring the complete external Melodius source collection.
+- `node tools/build_fmtest.mjs` builds both 143-byte test players. The old
+  test source set all operator TLs to `$7F` (maximum attenuation) despite
+  comments saying TL 0; they are now `$00`, so the test produces a tone.
+  `node tools/build_fmtest_po.mjs` builds the local `FMTEST.po` through
+  Cadius and checks its volume. The previous hand-edited bitmap leaked many
+  baseline blocks; do not restore that packager. `FMTEST.po` is local.
+- Verification with AppleWin Release, isolated per-slot INI files, 2 MHz,
+  and `-fm-wav-dump`: The FM test gave peak 32704 on both slots with FM enabled,
+  and peak 0 on both with FM disabled. The `X16ROBOTS / MAIN` autoplay image
+  reached 18.4 s on both slots; peaks were 9853 / 10732 with FM enabled and
+  3232 with FM disabled. These are mixed-audio measurements, not listening
+  tests. `CHECKVOLUME` passes for both images; physical hardware, Apple2TS,
+  listening and interactive controls still require validation of this mapping.
+- Only the two player files were replaced in the shipped Melodius image. A
+  ProDOS file-content comparison against the prior image matched all 143
+  non-player files, including the menus and songs. Historical milestones
+  above may refer to the old mapping or old packager and describe their
+  original builds.
+
+- The former `zsmplay` test was renamed `FMTEST`: it plays a short built-in
+  FM test sequence and is not a ZSM file player. The disk and STARTUP now use
+  `FMTEST.po`, `FMTEST.BIN`, and `FMTEST4.BIN`.
+
+- After the rename, the rebuilt `FMTEST.po` passed Cadius volume checks and
+  AppleWin FM-enabled and FM-disabled audio checks for both slots (4/4). The
+  old local `zsmplay.po` was removed.

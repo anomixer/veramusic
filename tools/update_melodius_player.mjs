@@ -17,10 +17,10 @@
  *   1. assemble zsmstream.asm for slot 2 and slot 4 with the builder's guards
  *      (branch labels defined, no unresolved $0000 operand, code below $3F00)
  *   2. write src/MELODIUS.BIN + src/MELODIUS4.BIN (the tracked build outputs)
- *   3. copy the image, REPLACEFILE both players with type/aux #062000, then
- *      swap the copy into place
- *   4. CHECKVOLUME, assert the catalog line (BIN $2000, new size), extract the
- *      player back out and compare it byte-for-byte with what was assembled
+ *   3. copy the image and REPLACEFILE both players with type/aux #062000
+ *   4. CHECKVOLUME, assert the catalog line (BIN $2000, new size), extract both
+ *      players and compare them byte-for-byte, then write the verified image
+ *   5. when updating the original image, rebuild its matching single-entry ZIP
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -28,6 +28,7 @@ import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { assembleAsmFile } from "../../veratest/src/asm6502.mjs";
+import { writeSingleFileZip } from "./single_file_zip.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(here, "..");
@@ -113,7 +114,7 @@ try {
 
 	// ---- verify before installing --------------------------------------------
 	const volume = run("CHECKVOLUME", workImage);
-	if (/\bError\s*:/im.test(volume)) fail(`Cadius volume errors:\n${volume}`);
+	if (/\bdeclared\b|\bError\s*:/im.test(volume)) fail(`Cadius volume errors:\n${volume}`);
 	const catalog = run("CATALOG", workImage);
 	const line = (name) => catalog.split(/\r?\n/).find((l) => new RegExp(`^\\s*${name}\\s+BIN\\s+\\$2000\\s+${player2.length}\\s`).test(l));
 	for (const name of ["MELODIUS.BIN", "MELODIUS4.BIN"]) {
@@ -121,16 +122,23 @@ try {
 	}
 	console.log("[3/4] CHECKVOLUME clean; catalog shows both players as BIN $2000");
 
-	const extractDir = path.join(tempRoot, "extract");
-	run("EXTRACTFILE", workImage, "/MELODIUS/MELODIUS.BIN", extractDir);
-	const extracted = fs.readdirSync(extractDir).map((f) => path.join(extractDir, f)).find((f) => /MELODIUS\.BIN/.test(path.basename(f)));
-	if (!extracted) fail("EXTRACTFILE produced no file");
-	if (!fs.readFileSync(extracted).equals(player2)) fail("extracted player differs from the assembled bytes");
-	console.log("[4/4] extracted player is byte-identical to the assembled binary");
+	for (const [name, expected] of [["MELODIUS.BIN", player2], ["MELODIUS4.BIN", player4]]) {
+		const extractDir = path.join(tempRoot, `extract-${name}`);
+		run("EXTRACTFILE", workImage, `/MELODIUS/${name}`, extractDir);
+		const extracted = fs.readdirSync(extractDir).map((f) => path.join(extractDir, f))
+			.find((f) => path.basename(f).startsWith(name));
+		if (!extracted) fail(`EXTRACTFILE produced no ${name}`);
+		if (!fs.readFileSync(extracted).equals(expected)) fail(`extracted ${name} differs from the assembled bytes`);
+	}
+	console.log("[4/4] both extracted players are byte-identical to the assembled binaries");
 
 	fs.writeFileSync(OUT, fs.readFileSync(workImage));
 	console.log(`[OK] wrote ${OUT}`);
 	if (OUT !== IMAGE) console.log(`     (source image ${IMAGE} was not modified)`);
+	else {
+		writeSingleFileZip(OUT);
+		console.log(`[OK] wrote ${OUT}.zip`);
+	}
 } finally {
 	fs.rmSync(tempRoot, { recursive: true, force: true });
 }

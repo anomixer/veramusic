@@ -1,5 +1,9 @@
 # VERA Port Project — AI Handoff Document
 
+> Historical note: the September 2026 assumptions below predate A2VERA EV1
+> YM2151 support. Current FM ports are Slot 2 `$C0A0/$C0A1` and Slot 4
+> `$C0C0/$C0C1`; see the repository's current `AGENTS.md` and `README.md`.
+
 **Session**: 2026-09-10, conversation between `anomixer` and Perplexity
 **Purpose**: Full context transfer so a new AI assistant can continue the Apple II VERA work without re-deriving any findings.
 **Companion docs**: `veratest/AGENTS.md` (hardware + build reference) and `docs/vera-session.md` (session log through Time Pilot v1.9 / veratest v0.0.3). This file covers the work started **after** those docs.

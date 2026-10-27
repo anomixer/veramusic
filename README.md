@@ -7,11 +7,15 @@
 [![Platform](https://img.shields.io/badge/platform-Apple%20II%20%7C%20IIe%20%7C%20IIgs-orange.svg)]()
 [![Hardware](https://img.shields.io/badge/hardware-VERA%20Card%20(Slot%202%20%2F%204)-brightgreen.svg)]()
 
-`veramusic` is an end-to-end music conversion toolchain and real-time playback system for the **Apple II** family equipped with an experimental **VERA (Versatile Embedded Retro Adapter)** card in Slot 2 (`$C0A0`) or Slot 4 (`$C0C0`).
+`veramusic` is an end-to-end music conversion toolchain and real-time playback system for the **Apple II** family equipped with a **VERA (Versatile Embedded Retro Adapter)** card in Slot 2 or Slot 4. VERA registers use `$C200` / `$C400`; the optional YM2151 FM ports use `$C0A0/$C0A1` / `$C0C0/$C0C1`.
+
+> **FM I/O update (2026-10-27):** The Apple II players and `melodius.hdv` now use the corrected `/DEVICE SELECT` FM addresses. Use a matching updated AppleWin or A2VERA implementation; older builds using `$Cs20/$Cs21` are incompatible. This migration was implemented with AI assistance.
 
 Tested on:
 - **Real Hardware**: Enhanced Apple IIe, Apple IIgs, Laser 128 with VERA card.
 - **Emulators**: [Apple2TS](https://github.com/ct6502/apple2ts) (WebAssembly), [AppleWin VERA Fork](https://github.com/anomixer/AppleWin).
+
+The new FM mapping has been checked in AppleWin for both slots; its behavior on physical hardware and other emulators still needs verification.
 
 ---
 
@@ -45,9 +49,9 @@ Tested on:
   - Adjustable engine gains (`--fmvol`/`F1`/`F2`, `--psgvol`/`F3`/`F4`, `--pcmvol`/`F5`/`F6`); defaults **FM 1.0×, PSG 2.0×, PCM 2.0×** = the board's `(PSG + PCM) * 2 + YM` mix.
   - ZSM `key-off` + `key-on` retriggers inside one tick are honoured (one native YM sample is clocked after a key-off, matching x16emu), so every FM note re-attacks instead of only the first.
   - `--wav out.wav` renders the whole track offline to a 48 kHz stereo WAV and exits, for A/B comparison against a reference render.
-- **Apple //e FM Test Player (`src/zsmplay.asm`, legacy)**:
-  - A 120-line 65C02 program that plays an **embedded** ZSM event stream through the VERA card's FM daughterboard registers (`VERA_BASE + $20` register select, `VERA_BASE + $21` data/status), the Apple-side equivalent of the X16's `$9F40`/`$9F41`. It was the bring-up test for that interface and has been superseded by the streaming jukebox below.
-  - No disk image is committed: `node tools/build_zsmplay_po.mjs` packs `zsmplay.po` (140 KB ProDOS floppy, auto-starting Applesoft `STARTUP` that probes slot 2 / slot 4 VERA then `BRUN`s the player) locally from `src/ZSMPLAY.BIN` (slot 2) and `src/ZSMPLAY4.BIN` (slot 4), both loaded at `$2000`; it exits via `RTS` so control returns cleanly to BASIC.
+- **Apple //e FM Sound Test (`src/fmtest.asm`)**:
+  - A 65C02 program that plays a short built-in FM test sequence through `YM_SEL` / `YM_DATA` (`$C0A0/$C0A1` or `$C0C0/$C0C1`). It was the bring-up test for that interface and has been superseded by the streaming jukebox below.
+  - `node tools/build_fmtest.mjs` assembles both slot binaries; `node tools/build_fmtest_po.mjs` packs the local `FMTEST.po` through Cadius. Its BASIC `STARTUP` probes the VERA slot and runs the matching test program at `$2000`.
 - **Apple //e ZSM Jukebox (`src/zsmstream.asm` → `melodius.hdv`)**:
   - A real 6502 ZSM player: streams `.ZSM` files from ProDOS disk (decode-ahead in the main loop, never in the IRQ) and plays all three VERA engines — PSG, YM2151 FM and the PCM FIFO — then `BRUN`s at `$2000`.
   - **Tick-rate normalization** follows zsmkit: the decoder folds `tickRate/60` stream ticks (plus a carried remainder) into each 60 Hz output frame, so non-60 Hz files play at tempo — Headbanger at 240 ticks/s used to run 4× slow — and rates below 60 publish hold frames. The frame counter tracks source ticks, so the 5 s seek keys scale with the file's tick rate.
@@ -128,8 +132,8 @@ exact frame it stopped on rather than skipping ahead behind the silence
 the whole pause).
 
 `node tools/update_melodius_player.mjs` refreshes the player inside an existing
-image (assemble both slots, `REPLACEFILE`, then volume/catalog/byte round-trip
-checks) without needing the Melodius source collection, which the full
+image and its ZIP (assemble both slots, `REPLACEFILE`, then volume/catalog/byte
+round-trip checks for both players) without needing the Melodius source collection, which the full
 `build_melodius.mjs` does.
 
 ---
@@ -144,7 +148,7 @@ too small to carry a ZSM decoder — so `veratest`'s build converts those tracks
 into **VZM**, a byte-oriented derivative tuned for the Apple II + VERA case
 ("A2VERA"). VZM is not a second encoder: it is a re-packing of the same ZSM
 writes, one record per tick, so the YM2151 arrangement from the tracker still
-reaches the daughterboard.
+reaches the YM2151.
 
 | Leading byte | Meaning | Followed by |
 | :--- | :--- | :--- |
@@ -202,10 +206,10 @@ veramusic/
 │   ├── pcmstream.asm          # ProDOS MLI OPEN/READ stream player (PCM)
 │   ├── pcmplay.asm            # Host RAM-resident PCM player
 │   ├── hybridstream.asm       # Legacy hybrid player (not packaged by current builder)
-│   ├── zsmplay.asm            # Legacy FM bring-up player (embedded stream, VERA FM slot 2/4)
-│   ├── ZSMPLAY.BIN            # Built player binary, slot 2 ($2000 BRUN)
-│   ├── ZSMPLAY4.BIN           # Built player binary, slot 4 ($2000 BRUN)
-│   ├── zsmplay_startup.bas    # Applesoft BASIC VERA slot probe → BRUN ZSMPLAY.BIN
+│   ├── fmtest.asm            # FM sound test (VERA FM slot 2/4)
+│   ├── FMTEST.BIN            # Built test binary, slot 2 ($2000 BRUN)
+│   ├── FMTEST4.BIN           # Built test binary, slot 4 ($2000 BRUN)
+│   ├── fmtest_startup.bas    # Applesoft BASIC VERA slot probe → BRUN FMTEST.BIN
 │   ├── zsmstream.asm          # Apple //e ZSM jukebox engine (PSG + YM2151 FM + streamed PCM)
 │   ├── MELODIUS.BIN           # Built jukebox binary, slot 2 ($2000 BRUN)
 │   ├── MELODIUS4.BIN          # Built jukebox binary, slot 4 ($2000 BRUN)
@@ -223,7 +227,8 @@ veramusic/
 │   ├── melodius.exe            # Native Windows x86 Commander X16 ZSM/ZCM player
 │   ├── melodius.cpp            # Source code for melodius (ymfm YM2151 + VERA PSG + VERA PCM + WinMM)
 │   ├── build_melodius.bat      # MSVC build script for melodius.exe
-│   ├── build_zsmplay_po.mjs   # Packs zsmplay.po locally (ZSMPLAY.BIN + STARTUP); the image is not committed
+│   ├── build_fmtest_po.mjs   # Packs FMTEST.po locally (FMTEST.BIN + STARTUP); the image is not committed
+│   ├── build_fmtest.mjs      # Assemble both slot-specific FM test binaries
 │   ├── zsm_scan.mjs           # ZSM analyzer (event histogram + header/PCM table dump)
 │   ├── zsm_pan.mjs            # ZSM stereo panning usage analyzer
 │   ├── zsm2psg.mjs            # Commander X16 ZSM → 60 Hz PSG stream converter
@@ -233,6 +238,7 @@ veramusic/
 │   ├── build_jukebox.mjs      # ProDOS volume packager & automatic ZIP generator
 │   ├── build_melodius.mjs     # Apple //e jukebox: assembles zsmstream.asm, splits PCM companions, packs melodius.hdv
 │   ├── update_melodius_player.mjs # Player-only update of an existing melodius.hdv (no Melodius collection needed)
+│   ├── single_file_zip.mjs     # Rebuild the matching ZIP when the image is updated in place
 │   ├── zsm_pcm_resample.mjs   # ZSM PCM instrument resampler (decimates high-rate samples to the jukebox rate)
 │   └── check_psg.mjs          # 6502 cycle & register write validator
 ├── music/                     # Source projects and converted streams (.ftm, .mid, .mod, .psg, .pcm)
@@ -274,7 +280,13 @@ build.bat jukebox
 
 # Assemble src/zsmstream.asm and pack the Apple //e ZSM jukebox (melodius.hdv + .zip)
 build.bat melodius
+
+# Assemble the FM sound test and create the local FMTEST.po floppy
+node tools/build_fmtest.mjs
+node tools/build_fmtest_po.mjs
 ```
+
+`build_melodius.mjs` needs the complete external music collection. If it is unavailable, `node tools/update_melodius_player.mjs` updates the two players in the existing `melodius.hdv`, verifies both extracted binaries and rebuilds its ZIP. `--out <path>` writes a separate test image without altering the original image or ZIP. Both build paths use the sibling `veratest` assembler with `FM_BASE` support.
 
 ### Manual Audio Conversions
 ```cmd
@@ -439,18 +451,18 @@ T: mm:ss.c B:xxxx V:15
 ## Hardware Architecture Notes
 
 - **PSG Base Address**: `$1F9C0` in VERA address space. 4 bytes per voice `[freq_lo, freq_hi, ctrl, wave]`.
-- **PCM Base Address**: `$1F9C0 + $1D` (`VERA_AUDIO_DATA`), rate register `$1E`, ctrl register `$1C`.
+- **PCM Registers**: VERA offsets `$1B` (control), `$1C` (rate), `$1D` (FIFO data).
 - **Clock Reference**: VERA internal audio base clock = `25 MHz / 512 = 48,828.125 Hz`. Rate 21 = `8,010.864 Hz`.
 - **Slot I/O**:
-  - Slot 2: Registers mapped to `$C0A0`..`$C0BF`.
-  - Slot 4: Registers mapped to `$C0C0`..`$C0DF`.
+  - Slot 2: VERA registers `$C200`..`$C21F`.
+  - Slot 4: VERA registers `$C400`..`$C41F`.
   - Auto-detected at boot by reading and writing VERA scratch registers.
-- **YM2151 FM (AppleWin VERA fork only)**:
-  - Register select at slot base + `$20`, data at slot base + `$21` (e.g. `$C220` / `$C221` on Slot 2).
-  - Not present on physical VERA cards — emulated by the AppleWin fork with the ymfm core; `tools/melodius.exe` renders the identical mix natively on Windows.
+- **YM2151 FM**:
+  - `/DEVICE SELECT`: Slot 2 `$C0A0` (`YM_SEL`) / `$C0A1` (`YM_DATA`); Slot 4 `$C0C0` / `$C0C1`. The old `$Cs20/$Cs21` FM mapping is no longer used.
+  - A2VERA EV1 supports YM2151 / OPM2151; AppleWin emulates YM2151 with ymfm. `tools/melodius.exe` renders the mix natively on Windows.
 - **Mix Balance**:
   - The X16 Developer Board sums the engines as `(PSG + PCM) * 2 + YM`. A single full-volume PSG voice is 1/8 of full scale, so the ×2 on the VERA bus is required for the PSG to sit correctly against the YM2151; `melodius.exe` reproduces that balance with a linear sum and a hard clip at full scale.
-  - `tools/melodius.exe` implements this balance (FM 1.0×, PSG/PCM 2.0×, linear output). AppleWin's `VERACard::UpdateSound` still uses a 1:1 `PSG + YM` sum and is the remaining follow-up.
+  - `tools/melodius.exe` and AppleWin's `VERACard::UpdateSound` implement this balance (FM 1.0×, PSG/PCM 2.0×, linear output with clipping).
 
 ---
 

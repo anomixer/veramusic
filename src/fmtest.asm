@@ -1,14 +1,12 @@
 ; ==============================================================================
 ; ZSMPLAY.ASM — Apple II VERA FM/PSG ZSM Player
 ; Loaded via BRUN at $2000 under ProDOS BASIC.SYSTEM.
-; Plays embedded ZSM event stream to YM2151 (FM) registers.
+; Writes a short built-in sequence to the YM2151 (FM) registers.
 ; Exit: RTS back to BASIC (BRUN vectors return to BASIC.SYSTEM).
 ; ==============================================================================
 * = $2000
 
-VERA_BASE = $C200
-YM_REG    = VERA_BASE + $20      ; YM2151 register select
-YM_DATA   = VERA_BASE + $21      ; YM2151 data / status
+; YM_SEL / YM_DATA come from vera.inc, with FM_BASE selected by slot.
 KBD_STROBE = $C000
 
 START:
@@ -18,7 +16,7 @@ START:
     STA KBD_STROBE
 
     JSR INIT_FM
-    JSR PLAY_STREAM
+    JSR PLAY_TEST
     JSR KEY_OFF_ALL
 
     CLI
@@ -33,7 +31,7 @@ INIT_LOOP:
     LDA INIT_REGS,X
     CMP #$FF
     BEQ INIT_DONE
-    STA YM_REG
+    STA YM_SEL
     LDA INIT_REGS+1,X
     STA YM_DATA
     INX
@@ -43,27 +41,27 @@ INIT_DONE:
     RTS
 
 ; ---------------------------------------------------------------------------
-; PLAY_STREAM — walk the embedded ZSM event list, writing FM reg/val pairs
+; PLAY_TEST — walk the built-in test event list, writing FM reg/val pairs
 ; ---------------------------------------------------------------------------
-PLAY_STREAM:
+PLAY_TEST:
     LDX #0
-STREAM_LOOP:
-    LDA ZSM_STREAM,X
+TEST_LOOP:
+    LDA TEST_EVENTS,X
     CMP #$FF                    ; $FF = end of stream
-    BEQ STREAM_DONE
-    STA YM_REG
-    LDA ZSM_STREAM+1,X
+    BEQ TEST_DONE
+    STA YM_SEL
+    LDA TEST_EVENTS+1,X
     STA YM_DATA
     INX
     INX
     JSR DELAY_FRAME
-    JMP STREAM_LOOP
-STREAM_DONE:
+    JMP TEST_LOOP
+TEST_DONE:
     RTS
 
 KEY_OFF_ALL:
     LDA #$08
-    STA YM_REG
+    STA YM_SEL
     LDA #$00
     STA YM_DATA
     RTS
@@ -93,10 +91,10 @@ INIT_REGS:
     .byte $48, $01              ; op1 MUL=1
     .byte $50, $01              ; op2 MUL=1
     .byte $58, $01              ; op3 MUL=1
-    .byte $60, $7F              ; op0 TL=0 (max volume)
-    .byte $68, $7F              ; op1 TL=0
-    .byte $70, $7F              ; op2 TL=0
-    .byte $78, $7F              ; op3 TL=0
+    .byte $60, $00              ; op0 TL=0 (max volume)
+    .byte $68, $00              ; op1 TL=0
+    .byte $70, $00              ; op2 TL=0
+    .byte $78, $00              ; op3 TL=0
     .byte $80, $1F              ; AR=max (instant attack)
     .byte $88, $1F
     .byte $90, $1F
@@ -108,9 +106,9 @@ INIT_REGS:
     .byte $FF                    ; terminator
 
 ; ---------------------------------------------------------------------------
-; ZSM_STREAM — FM reg/val pairs from TITLE.ZSM intro (terminated by $FF)
+; TEST_EVENTS — FM test reg/val pairs (terminated by $FF)
 ; ---------------------------------------------------------------------------
-ZSM_STREAM:
+TEST_EVENTS:
     .byte $28, $4A              ; KC concert A
     .byte $08, $78              ; key on ch0
     .byte $08, $00              ; key off

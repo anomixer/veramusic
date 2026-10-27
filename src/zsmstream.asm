@@ -1,6 +1,6 @@
 ; ==============================================================================
 ; ZSMSTREAM.ASM — Apple II ZSM Jukebox Player (VERA PSG + YM2151 FM)
-; Companion to zsmplay.asm (M31 embedded FM demo). Streams a real ZSM song
+; Companion to fmtest.asm (FM sound test). Streams a real ZSM song
 ; from a ProDOS file, decoding PSG writes + YM2151 batches into a double
 ; frame buffer that the VERA IRQ applies once per VSYNC frame.
 ;
@@ -57,7 +57,7 @@
 ; pressed, so the menu program resumes where it left off.
 ; AUTOPLAY = 1 (injected via --autoplay build) auto-starts song 0 for headless.
 ;
-; Conventions: asm6502.mjs syntax, VERA_BASE injected ($C200 slot2/$C400 slot4),
+; Conventions: asm6502.mjs injects VERA_BASE ($C200/$C400) and FM_BASE ($C0A0/$C0C0),
 ; $2000 BRUN, dual slot. Code below $3F00. Zero page $06-$37.
 ; ==============================================================================
 
@@ -141,10 +141,6 @@ ZP_SAVE   = $6A00    ; snapshot of Applesoft zero page $06-$37 (50 B)
 
 AUTOPLAY = 0         ; release: menu only. --autoplay build injects AUTOPLAY=1.
 AUTOSONG = 0         ; which song index AUTOPLAY auto-starts (injectable).
-
-; FM daughterboard host registers (local — not in vera.inc)
-YM_REG  = VERA_BASE + $20   ; YM_REG select
-YM_DATA = VERA_BASE + $21   ; YM_DATA write (read = status)
 
 START:
     SEI
@@ -2877,7 +2873,7 @@ TICK_YML:
 TICK_YML_R:
     LDA (FB_RD_L),Y       ; reg
     TAX
-    STA YM_REG
+    STA YM_SEL
     INY
     BNE TICK_YML_V
     INC FB_RD_H
@@ -3227,7 +3223,7 @@ FM_KEY_OFF:
     ; bits set it keys off that channel, so all eight have to be written --
     ; a single $08=$00 write only ever silenced channel 0.
     LDA #$08
-    STA YM_REG
+    STA YM_SEL
     LDX #$00
 FKO_LOOP:
     TXA
@@ -3244,7 +3240,7 @@ FKO_LOOP:
 ; re-send resumes the same notes rather than a made-up chord.
 FM_KEYS_RESTORE:
     LDA #$08
-    STA YM_REG
+    STA YM_SEL
     LDX #$00
 FKR_LOOP:
     LDA FM_KEYS,X

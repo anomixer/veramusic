@@ -47,6 +47,11 @@ VERA_AUDIO_DATA = VERA_BASE + $1D  ; PCM Audio FIFO Data Port
 VERA_SPI_DATA   = VERA_BASE + $1E  ; SPI Data
 VERA_SPI_CTRL   = VERA_BASE + $1F  ; SPI Control
 
+; YM2151 uses /DEVICE SELECT. FM_BASE is injected by the slot-aware assembler:
+; slot 2 $C0A0/$C0A1, slot 4 $C0C0/$C0C1.
+YM_SEL          = FM_BASE + $00  ; register select (write only)
+YM_DATA         = FM_BASE + $01  ; data write / status read
+
 ; Apple II Hardware Softswitches
 KBD_DATA      = $C000            ; Read Keyboard Data (Bit 7 = Key pressed)
 KBD_STROBE    = $C010            ; Clear Keyboard Strobe
