@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VERA Music — two Apple II jukeboxes in your browser</title>
+<meta name="description" content="Two bootable Apple II jukeboxes for the VERA card: a six-track PSG/PCM showreel and Melodius, a 94-song Commander X16 ZSM player with YM2151 FM. Both boot in Apple2TS straight from this repository." />
+<link rel="canonical" href="https://anomixer.github.io/veramusic/" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="VERA Music — two Apple II jukeboxes" />
+<meta property="og:description" content="A six-track PSG + PCM jukebox and Melodius, a 94-song ZSM player with YM2151 FM on an Apple //e with VERA. Play both in Apple2TS." />
+<meta property="og:url" content="https://anomixer.github.io/veramusic/" />
+<meta property="og:image" content="https://anomixer.github.io/veramusic/assets/jukebox-menu.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="theme-color" content="#07070c" />
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="./">
+      <img src="assets/logo.svg" alt="" width="30" height="30" />
+      <span>VERA Music<small>Apple II · 6502</small></span>
+    </a>
+    <nav class="nav" aria-label="Page sections">
+      <a class="play" href="#disks">Play</a>
+      <a href="#jukebox">Jukebox</a>
+      <a href="#melodius">Melodius</a>
+      <a href="#players">Players</a>
+      <a href="#how">How it works</a>
+      <a href="#build">Build</a>
+      <a class="gh" href="https://github.com/anomixer/veramusic">GitHub ↗</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <p class="eyebrow"><span class="dot"></span>A2VERA · Apple //e · pure 6502</p>
+        <h1>Two jukeboxes.<br />One <span class="grad">VERA</span> card.</h1>
+        <p class="lede">
+          A six-track <strong>PSG + PCM</strong> showreel and <strong>Melodius</strong>, a 94-song
+          Commander X16 jukebox with <strong>emulated YM2151 FM</strong> — written in pure 6502 and
+          streamed from ProDOS. Pick a disk; it boots here, in your browser.
+        </p>
+
+        <div class="cta">
+          <a class="btn primary" href="https://apple2ts.com/?theme=dark&amp;slot2=vera&amp;tab=vera#https://raw.githubusercontent.com/anomixer/veramusic/master/jukebox.hdv" target="_blank" rel="noopener">
+            ▶ Run jukebox.hdv <span class="tag">Apple2TS</span>
+          </a>
+          <a class="btn secondary" href="https://apple2ts.com/?theme=dark&amp;slot2=vera&amp;tab=vera#https://raw.githubusercontent.com/anomixer/veramusic/master/melodius.hdv" target="_blank" rel="noopener">
+            ▶ Run melodius.hdv <span class="tag">Apple2TS</span>
+          </a>
+        </div>
+
+        <p class="hint">
+          Opens Apple2TS in a new tab with the 32 MiB disk streamed from this repository — VERA already
+          in slot 2, and the “VERA Monitor” tab showing the 640×480 text screen. The first boot pulls
+          the image from GitHub, so give it a few seconds. Click the emulator once for keyboard focus
+          and audio.
+        </p>
+      </div>
+
+      <figure class="hero-shot">
+        <img src="assets/jukebox-menu.png" alt="The jukebox.hdv menu on an Apple II text screen: six numbered tracks, a status line reading VERA CARD ON SLOT 2, and control hints" width="640" height="480" />
+        <figcaption><span>jukebox.hdv — R7 menu</span><b>6 tracks · PSG + PCM</b></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="disks">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="kicker">The two images</p>
+        <h2>Two disks, one VERA card</h2>
+        <p>
+          Both are bootable ProDOS 2.4.3 volumes with Slot 2 and Slot 4 binaries and a BASIC launcher
+          that probes the card before starting. They run from the image, or from a directory on your
+          own ProDOS disk.
+        </p>
+      </div>
+
+      <div class="image-grid">
+        <article class="image-card">
+          <div class="image-card-head">
+            <h3>jukebox.hdv</h3>
+            <span class="size">32 MiB · HDV</span>
+          </div>
+          <figure>
+            <img src="assets/jukebox-playing.png" alt="jukebox.hdv playing Beat It: the title line, a 16-slot voice activity meter and a T: 00:08.6 clock on the bottom text row" width="1280" height="960" loading="lazy" />
+            <figcaption>Beat It · 16-voice PSG + GM drums</figcaption>
+          </figure>
+          <div class="image-card-body">
+            <p>
+              Six tracks through four engines: a RAM-resident PSG demo, Chopin’s
+              <em>Fantaisie-Impromptu</em> pre-loaded into VERA’s 128 KiB SRAM, streamed PSG for
+              <em>Beat It</em> and <em>Caribbean Blue</em>, and 8 kHz
+              PCM for <em>Space Debris</em> and <em>The Wellerman</em>. The player keeps a live
+              16-voice meter and a running clock on the last text row.
+            </p>
+            <ul class="tags">
+              <li>6502</li><li>16-voice PSG</li><li>8 kHz PCM</li><li>VERA SRAM</li>
+            </ul>
+          </div>
+          <div class="image-card-actions">
+            <a class="btn primary" href="https://apple2ts.com/?theme=dark&amp;slot2=vera&amp;tab=vera#https://raw.githubusercontent.com/anomixer/veramusic/master/jukebox.hdv" target="_blank" rel="noopener">Play in Apple2TS</a>
+            <a class="btn flat" href="https://raw.githubusercontent.com/anomixer/veramusic/master/jukebox.hdv.zip">Download .zip</a>
+          </div>
+        </article>
+
+        <article class="image-card">
+          <div class="image-card-head">
+            <h3>melodius.hdv</h3>
+            <span class="size">32 MiB · HDV</span>
+          </div>
+          <figure>
+            <img src="assets/melodius-playing.png" alt="Melodius playing Watching Paint Dry: a MELODIUS / FURN: BURNT FISHY header, a track title and a 16-slot status meter" width="1280" height="960" loading="lazy" />
+            <figcaption>Watching Paint Dry · YM2151 FM + PSG</figcaption>
+          </figure>
+          <div class="image-card-body">
+            <p>
+              A two-level jukebox for <strong>94 ZSM files in 17 categories</strong> — eleven Furnace
+              artists, five Commander X16 game soundtracks and the PCM-only <em>TREE</em>. YM2151 FM,
+              the 16 PSG voices and the PCM FIFO can all play at once from a single ZSM stream.
+            </p>
+            <ul class="tags">
+              <li>YM2151 FM</li><li>94 ZSM songs</li><li>PCM FIFO</li><li>Slot 2 / 4</li>
+            </ul>
+          </div>
+          <div class="image-card-actions">
+            <a class="btn primary" href="https://apple2ts.com/?theme=dark&amp;slot2=vera&amp;tab=vera#https://raw.githubusercontent.com/anomixer/veramusic/master/melodius.hdv" target="_blank" rel="noopener">Play in Apple2TS</a>
+            <a class="btn flat" href="https://raw.githubusercontent.com/anomixer/veramusic/master/melodius.hdv.zip">Download .zip</a>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <section id="jukebox">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="kicker">jukebox.hdv · menu 1–6</p>
+        <h2>Six tracks, four playback engines</h2>
+        <p>
+          The whole lineup fits in one 32 MiB ProDOS volume. Every player is a 6502 binary; nothing
+          is decoded or mixed on the host.
+        </p>
+      </div>
+
+      <div class="table-panel">
+        <div class="table-scroll">
+          <table class="tracks">
+            <caption>Included jukebox lineup</caption>
+            <thead>
+              <tr><th scope="col">#</th><th scope="col">Track</th><th scope="col">Engine</th><th scope="col">Time</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="num">01</td><td class="title">Melody Demo</td><td class="fmt">RAM PSG</td><td class="time">0:30</td></tr>
+              <tr><td class="num">02</td><td class="title">Fantaisie-Impromptu</td><td class="fmt">VERA SRAM PSG</td><td class="time">5:02</td></tr>
+              <tr><td class="num">03</td><td class="title">Beat It</td><td class="fmt">Stream PSG</td><td class="time">3:58</td></tr>
+              <tr><td class="num">04</td><td class="title">Caribbean Blue</td><td class="fmt">Stream PSG</td><td class="time">2:56</td></tr>
+              <tr><td class="num">05</td><td class="title">Space Debris</td><td class="fmt">Stream PCM</td><td class="time">5:05</td></tr>
+              <tr><td class="num">06</td><td class="title">The Wellerman</td><td class="fmt">Stream PCM</td><td class="time">2:00</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <p class="table-note">
+        <span>Fantaisie-Impromptu is copied into VERA’s onboard SRAM before the first note, so the floppy version never moves its drive head during playback.</span>
+        <a href="https://apple2ts.com/?theme=dark&amp;slot2=vera&amp;tab=vera#https://raw.githubusercontent.com/anomixer/veramusic/master/jukebox.po" target="_blank" rel="noopener">▶ Also on a 140 KiB floppy: jukebox.po ↗</a>
+      </p>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <section id="melodius">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="kicker">melodius.hdv · 94 songs</p>
+        <h2>Ninety-four songs, seventeen shelves</h2>
+        <p>
+          Melodius streams Commander X16 ZSM files from ProDOS. Each frame’s register writes are
+          decoded ahead in the main loop, then published from the 60 Hz interrupt; FM and PSG stay in
+          sync with streamed PCM samples.
+        </p>
+      </div>
+
+      <div class="shelves">
+        <article class="shelf">
+          <h3>Furnace <span>11 artists · 67 songs</span></h3>
+          <ul>
+            <li><b>Bernie</b> <em>1</em></li>
+            <li><b>Burnt Fishy</b> <em>1</em></li>
+            <li><b>Crisps</b> <em>17</em></li>
+            <li><b>GTR3QQ</b> <em>16</em></li>
+            <li><b>Lunathir</b> <em>1</em></li>
+            <li><b>MooingLemur</b> <em>4</em></li>
+            <li><b>MooingLemur &amp; ZeroByte</b> <em>2</em></li>
+            <li><b>SnugglyBun</b> <em>5</em></li>
+            <li><b>dumbut</b> <em>9</em></li>
+            <li><b>nicco1690</b> <em>10</em></li>
+            <li><b>usersniper</b> <em>1</em></li>
+          </ul>
+        </article>
+
+        <article class="shelf">
+          <h3>Game soundtracks <span>5 games · 26 songs</span></h3>
+          <ul>
+            <li><b>Mine-Rescue</b> <em>5</em></li>
+            <li><b>Montezuma</b> <em>4</em></li>
+            <li><b>Quarx</b> <em>3</em></li>
+            <li><b>Tetrads</b> <em>4</em></li>
+            <li><b>X16 Robots</b> <em>10</em></li>
+          </ul>
+          <p class="note">Menu music, high-score loops and game-over stings from the Commander X16 ports.</p>
+        </article>
+
+        <article class="shelf">
+          <h3>PCM <span>1 track</span></h3>
+          <ul>
+            <li><b>TREE</b> <em>1</em></li>
+          </ul>
+          <p class="note">A ZSM whose music is entirely the VERA PCM FIFO: samples stream from the companion <code>PCM01.PCM</code> while the FIFO refills from disk in 2 KiB windows.</p>
+        </article>
+      </div>
+
+      <p class="table-note">
+        <span>Tick rates from 50 Hz to 240 Hz are normalised to the 60 Hz output clock, so a 240 Hz file such as <em>Headbanger!</em> lasts 4:24 rather than 17:34. 28 tracks carry PCM instruments, decimated at build time to 8,011 Hz and shipped as companion <code>.PCM</code> files.</span>
+      </p>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <section id="players">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="kicker">In the player</p>
+        <h2>What the status line is telling you</h2>
+        <p>
+          Both jukeboxes paint a compact readout on the last text row and leave the middle of the
+          screen to the song. The controls are the same across every track.
+        </p>
+      </div>
+
+      <div class="two-col">
+        <ul class="keys" aria-label="Player controls">
+          <li><span>Choose a menu item</span><span class="combo"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>…</kbd><kbd>A</kbd><kbd>H</kbd></span></li>
+          <li><span>Confirm selection</span><span class="combo"><kbd>Return</kbd></span></li>
+          <li><span>Pause / resume</span><span class="combo"><kbd>P</kbd><kbd>Space</kbd></span></li>
+          <li><span>Mute / unmute</span><span class="combo"><kbd>M</kbd></span></li>
+          <li><span>Master volume 0–15</span><span class="combo"><kbd>+</kbd><kbd>−</kbd></span></li>
+          <li><span>Seek 5 seconds</span><span class="combo"><kbd>[</kbd><kbd>]</kbd></span></li>
+          <li><span>Loop (Melodius)</span><span class="combo"><kbd>L</kbd></span></li>
+          <li><span>Restart (Melodius)</span><span class="combo"><kbd>R</kbd></span></li>
+          <li><span>Back to BASIC</span><span class="combo"><kbd>Esc</kbd><kbd>Q</kbd></span></li>
+        </ul>
+
+        <aside class="panel">
+          <h3>16 slots, one text row</h3>
+          <p>
+            For PSG tracks the meter is one character per voice. For FM + PSG tracks the first eight
+            slots are YM2151 channels — shown while a note is keyed on — and the last eight are PSG
+            voices. PCM-only tracks swap the meter for the logical 512-byte chunk counter
+            <code>B:xxxx</code>.
+          </p>
+          <div class="status-line" role="group" aria-label="Example status lines">
+            <span>T: 00:12.4 [^ . . . . . . . = = . . . . .] V:15</span>
+            <span>B: 1A2F</span>
+          </div>
+          <div class="legend" role="group" aria-label="Voice meter legend">
+            <div><b>.</b>silent 0</div>
+            <div><b>-</b>quiet 1–14</div>
+            <div><b>=</b>medium 15–34</div>
+            <div><b>#</b>loud 35–49</div>
+            <div><b>^</b>peak 50–63</div>
+          </div>
+          <p>
+            The same numbers are written to the Apple II text page, so a single-monitor machine sees
+            them too. On a PCM track the chunk counter does not identify a physical disk block;
+            ProDOS resolves the file allocation on every read.
+          </p>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <section id="how">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="kicker">Under the hood</p>
+        <h2>Everything is 6502 and ProDOS MLI</h2>
+        <p>
+          No patched emulator features and no host audio mixing: the PSG and PCM paths run the same
+          on a real Apple IIe with a VERA card in slot 2 or slot 4. The YM2151 half of Melodius
+          writes the FM register window that the VERA emulation provides; PSG and PCM stay native
+          VERA hardware.
+        </p>
+      </div>
+
+      <div class="feat-grid">
+        <article class="feat">
+          <span class="tag">PSG</span>
+          <h3>Sixteen voices at 48,828 Hz</h3>
+          <p>
+            A 60 Hz event stream writes four bytes per voice; pulse, sawtooth, triangle and noise are
+            all hardware. Volume follows the card’s 64-step logarithmic curve, and additive partials
+            give the acoustic grand piano its bass foundation.
+          </p>
+        </article>
+        <article class="feat">
+          <span class="tag">PCM</span>
+          <h3>8,010.864 Hz, straight from disk</h3>
+          <p>
+            Eight-bit signed samples are TPDF-dithered at build time and streamed through
+            <code>OPEN</code> / <code>READ</code> into VERA’s 4 KiB FIFO. A 512-byte buffer rides out
+            disk seek latency at under 5% CPU.
+          </p>
+        </article>
+        <article class="feat">
+          <span class="tag">VERA SRAM</span>
+          <h3>A floppy that goes quiet</h3>
+          <p>
+            The SRAM pre-load player copies the whole PSG stream into the card’s 128 KiB before
+            playback starts. Seeking is instantaneous and the Disk II stays silent, even on a
+            140 KiB floppy.
+          </p>
+        </article>
+        <article class="feat">
+          <span class="tag">ZSM</span>
+          <h3>Decode ahead, never in the IRQ</h3>
+          <p>
+            The ZSM decoder walks ticks and batches FM register pairs in the main loop; the interrupt
+            only publishes the next frame. Companion PCM files are opened once and refilled in 2 KiB
+            windows while the sample plays.
+          </p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <section id="build">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="kicker">Build it</p>
+        <h2>Two commands, zero dependencies</h2>
+        <p>
+          The 6502 assembler, the Applesoft tokenizer and the disk packager are all in this
+          repository — plus the sibling <code>veratest</code> checkout.
+        </p>
+      </div>
+
+      <pre class="code"><span class="c">REM needs Node.js 18+ and a sibling C:\dev\veratest checkout</span>
+git clone https://github.com/anomixer/veramusic
+cd veramusic
+
+<span class="c">REM players, jukebox.po, jukebox.hdv + .zip</span>
+<span class="p">build.bat</span> quick
+<span class="c">REM assemble zsmstream.asm, pack melodius.hdv + .zip</span>
+<span class="p">build.bat</span> melodius</pre>
+
+      <ul class="build-notes">
+        <li><code>build.bat jukebox</code> reconverts every MIDI, MOD and PCM source before packing the images.</li>
+        <li>Set <code>CADIUS</code> to use a different Cadius executable; the bundled one is <code>tools/cadius.exe</code>.</li>
+        <li><code>tools/psgplay.exe</code> auditions <code>.psg</code> streams on Windows; <code>tools/melodius.exe</code> plays ZSM and ZCM with the board’s <code>(PSG + PCM) × 2 + YM</code> balance.</li>
+        <li><code>node tools/build_melodius.mjs --list</code> prints the 94-song index; <code>--autoplay &lt;n&gt;</code> writes a headless test image.</li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-top">
+      <div class="footer-links">
+        <a href="https://github.com/anomixer/veramusic">Source on GitHub ↗</a>
+        <a href="https://github.com/anomixer/veramusic#readme">README ↗</a>
+        <a href="https://apple2ts.com/">Apple2TS ↗</a>
+        <a href="https://github.com/mooinglemur/melodius">Melodius ↗</a>
+        <a href="https://github.com/fvdhoef/vera-module">VERA module ↗</a>
+      </div>
+      <div>MIT-licensed sources · built with a two-pass 6502 assembler</div>
+    </div>
+    <p class="credits">
+      VERA is the FPGA video and audio board from the Commander X16 project by
+      <a href="https://github.com/fvdhoef/vera-module">Frank van den Hoef</a>; the Apple II port and
+      <a href="https://apple2ts.com/">Apple2TS</a> emulator come from
+      <a href="https://github.com/ct6502">Chris Torrence</a> and contributors. Melodius is
+      <a href="https://github.com/mooinglemur/melodius">mooinglemur</a>’s X16 music player, and the
+      YM2151 core is <a href="https://github.com/aaronsgiles/ymfm">ymfm</a> by Aaron Giles. The ZSM
+      collection is the work of the Furnace artists and game composers credited in the menu. The
+      jukebox arrangements include Chopin’s <em>Fantaisie-Impromptu</em>, Michael Jackson’s
+      <em>Beat It</em>, Enya’s <em>Caribbean Blue</em>, Captain’s <em>Space Debris</em> and Alexander
+      Nakarada’s <em>The Wellerman</em>. This site and the ports are fan work — the original games,
+      artwork and music remain with their rights holders.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
