@@ -1,0 +1,50 @@
+name: Deploy landing page
+
+# Publishes the static site in docs/ to GitHub Pages. Nothing is built here:
+# the page is a hand-written index.html plus style.css, an SVG logo and three
+# screenshots, and it links to the disk images in this repository (raw master),
+# so a push that touches docs/ is all it takes to refresh the site.
+#
+# The repository must have Pages enabled with "GitHub Actions" as the source
+# (Settings -> Pages -> Source: GitHub Actions). GITHUB_TOKEN cannot switch
+# that setting by itself, so this workflow assumes it was done once.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Publish docs/ to Pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the site
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
