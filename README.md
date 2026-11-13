@@ -9,6 +9,8 @@
 
 `veramusic` is an end-to-end music conversion toolchain and real-time playback system for the **Apple II** family equipped with a **VERA (Versatile Embedded Retro Adapter)** card in Slot 2 or Slot 4. VERA registers use `$C200` / `$C400`; the optional YM2151 FM ports use `$C0A0/$C0A1` / `$C0C0/$C0C1`.
 
+> 🌐 **Landing page:** [anomixer.github.io/veramusic](https://anomixer.github.io/veramusic/) — one click boots `jukebox.hdv`, `melodius.hdv`, or the 140KB `jukebox.po` floppy in Apple2TS (VERA in slot 2), streaming the image straight from this repository. The page lives in [`docs/index.html`](docs/index.html).
+
 > **FM I/O update (2026-10-27):** The Apple II players and `melodius.hdv` now use the corrected `/DEVICE SELECT` FM addresses. Use a matching updated AppleWin or A2VERA implementation; older builds using `$Cs20/$Cs21` are incompatible. This migration was implemented with AI assistance.
 
 Tested on:
@@ -189,6 +191,7 @@ veramusic/
 ├── jukebox.hdv                # Pre-built bootable 32MB ProDOS hard disk image
 ├── jukebox.hdv.zip            # Compressed 32MB hard disk image (~2.7MB, auto-generated)
 ├── jukebox.po                 # Pre-built bootable 140KB ProDOS floppy disk image
+├── docs/                      # GitHub Pages landing page (index.html, style.css, screenshots)
 ├── melodius.hdv               # Pre-built bootable 32MB ProDOS hard disk (Apple //e jukebox: PSG + FM + PCM, 94 songs)
 ├── melodius.hdv.zip           # Compressed 32MB jukebox image (~3.6MB, auto-generated)
 ├── ymfm/                      # Bundled ymfm YM2151 core (self-contained for tools/melodius.exe)
