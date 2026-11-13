@@ -13,10 +13,6 @@
 
 > **FM I/O update (2026-10-27):** The Apple II players and `melodius.hdv` now use the corrected `/DEVICE SELECT` FM addresses. Use a matching updated AppleWin or A2VERA implementation; older builds using `$Cs20/$Cs21` are incompatible. This migration was implemented with AI assistance.
 
-Tested on:
-- **Real Hardware**: Enhanced Apple IIe, Apple IIgs, Laser 128 with VERA card.
-- **Emulators**: [Apple2TS](https://github.com/ct6502/apple2ts) (WebAssembly), [AppleWin VERA Fork](https://github.com/anomixer/AppleWin).
-
 The new FM mapping has been checked in AppleWin for both slots; its behavior on physical hardware and other emulators still needs verification.
 
 ---
